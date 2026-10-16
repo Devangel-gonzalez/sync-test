@@ -1,0 +1,32 @@
+schema_version = "1.0.0"
+# Change the values according to your extension
+id = "multi_user"
+version = "0.8.2"
+name = "Multiuser"
+blender_version_min = "4.5.0"
+tagline = "Enable real-time collaborative workflow inside blender"
+maintainer = "Swann Martinez <swann.martinez@protonmail.com>"
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+type = "add-on"
+platforms = ["windows-x64", "macos-x64", "macos-arm64", "linux-x64"]
+website = "https://slumber.gitlab.io/multi-user/index.html"
+wheels = [
+   "./wheels/orderly_set-5.2.3-py3-none-any.whl",
+   "./wheels/deepdiff-8.1.1-py3-none-any.whl",
+   "./wheels/replication-0.10.3-py3-none-any.whl",
+]
+
+[permissions]
+network = "Need to sync scene data to server"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".*",
+  "*.zip",
+  "cache/",
+  "venv/",
+  "tests/"
+]
