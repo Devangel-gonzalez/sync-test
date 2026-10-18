@@ -68,15 +68,118 @@ IDLE = "IDLE"
 INTERACTING = "INTERACTING"
 RESOLVING = "RESOLVING"
 
+# Blender exposes a running operator under several different names depending on
+# where you look: the dotted bl_idname ("transform.rotate"), the RNA identifier
+# ("TRANSFORM_OT_rotate") and the Python class name. Which one an entry of
+# wm.operators answers to is not stable across versions, so all forms are
+# listed and all of them are checked.
 TRANSFORM_OPERATORS = frozenset({
+    "transform.rotate",
+    "transform.translate",
+    "transform.resize",
+    "transform.transform",
+    "transform.trackball",
     "TRANSFORM_OT_rotate",
     "TRANSFORM_OT_translate",
     "TRANSFORM_OT_resize",
     "TRANSFORM_OT_transform",
+    # The 3D viewport's R key runs the trackball transform when the rotation
+    # method is set to Trackball, which is a default on many keymaps. A real
+    # session log showed exactly this identifier on the stack while the user
+    # rotated a pose bone and nothing streamed.
+    "TRANSFORM_OT_trackball",
 })
+
+# How long an in-progress transform may produce no motion before it is treated
+# as finished. wm.operators is an accumulative history, so the matched entry
+# can outlive the drag; real motion is what proves it is still running.
+TRANSFORM_IDLE_TIMEOUT = 1.0
+
+# How often an open stream re-sends the pose while nothing is changing. "start"
+# is broadcast only once per selection, so a viewer that connects afterwards
+# would otherwise see nothing at all until the Host next moves a bone. A newly
+# connected viewer is handled immediately by the client_count check in tick();
+# this is the safety net for a re-send that was missed while idle.
+HEARTBEAT_INTERVAL = 0.1
+
+# Set once wm.operators has proven unreadable, so the warning is emitted a
+# single time instead of on every one of the 60 ticks per second.
+_operator_stack_error_reported = False
 
 _MATRIX_EPSILON = 1e-4
 _VALUE_EPSILON = 1e-5
+
+
+def is_host() -> bool:
+    """True when this peer is the session Host.
+
+    Live Sync is a Host-only capability: continuous pushing and pose streaming
+    both flow outward from the Host, while a viewer stays passive.
+    """
+    try:
+        return bool(bpy.data.window_managers["WinMan"].session.is_host)
+    except (KeyError, AttributeError):
+        return False
+
+
+def interactive_transform_active():
+    """Return the running move/rotate/scale modal operator, or None.
+
+    Shared by the pose streamer and handlers.on_scene_update. README 7.8 keeps
+    porcelain out of an interactive transform for two reasons: a full
+    commit+push cannot keep up at 60 Hz, and pushing intermediate poses makes
+    viewers apply them through porcelain, which rebuilds the Action and wipes
+    the temporary keyframe overlay the live channel just wrote.
+    """
+    try:
+        operators = bpy.context.window_manager.operators
+    except (AttributeError, ReferenceError) as e:
+        # Returning None here is indistinguishable from "no transform is
+        # running", so an unreadable operator stack used to look exactly like
+        # an idle streamer in the log. Reported once: tick() calls this at
+        # 60 Hz and the failure, if real, does not come and go.
+        global _operator_stack_error_reported
+        if not _operator_stack_error_reported:
+            _operator_stack_error_reported = True
+            logging.warning(
+                f"Live Sync: cannot read wm.operators ({e!r}); interactive "
+                f"transforms will not be detected and poses will not stream")
+        return None
+
+    if not operators:
+        return None
+
+    # Only the top of the stack can still be running. wm.operators accumulates
+    # finished operators: one real session held ~45 entries, including twenty
+    # completed SessionToggleLiveSync invocations and a transform that had
+    # ended long before. Scanning all of them reports a finished drag as still
+    # in progress, which would suppress porcelain pushes indefinitely.
+    op = operators[-1]
+    for identity in _operator_identities(op):
+        if identity in TRANSFORM_OPERATORS:
+            return op
+    return None
+
+
+def _operator_identities(op):
+    """Yield every name Blender may expose for a running operator.
+
+    An entry of wm.operators answers to its dotted bl_idname, to its RNA
+    identifier and to its Python class name. Which attribute is actually
+    populated varies with the operator and the Blender version, so all three
+    are offered to the caller instead of guessing one.
+    """
+    bl_idname = getattr(op, "bl_idname", None)
+    if bl_idname:
+        yield bl_idname
+
+    class_name = type(op).__name__
+    if class_name:
+        yield class_name
+
+    identifier = getattr(getattr(op, "bl_rna", None), "identifier", None)
+    if identifier:
+        yield identifier
 
 
 # --------------------------------------------------------------------------- #
@@ -336,28 +439,44 @@ class HostPoseStreamer:
         self.armature = None
         self.armature_uuid = None
         self.frame = None
+        # True only while a real drag is in progress, which is narrower than
+        # "streaming": the overlay also runs while a bone is merely selected,
+        # and that must not suppress porcelain pushes.
+        self.transform_active = False
         self._bones = {}  # bone_name -> {"original": Matrix, "sent": Matrix}
         self._last_send = 0.0
+        self._last_motion = 0.0
+        self._last_broadcast = 0.0
+        self._last_client_count = 0
+        self._last_skip_log = 0.0
 
     def reset(self):
         self.state = IDLE
         self.armature = None
         self.armature_uuid = None
         self.frame = None
+        self.transform_active = False
         self._bones.clear()
         self._last_send = 0.0
+        self._last_motion = 0.0
+        self._last_broadcast = 0.0
+        self._last_client_count = 0
+
+    def _log_skip(self, reason: str):
+        """Report why a detected transform produced no stream, once per second.
+
+        tick() runs at 60 Hz, so an unthrottled log here would bury the file.
+        """
+        now = time.monotonic()
+        if now - self._last_skip_log < 1.0:
+            return
+        self._last_skip_log = now
+        logging.info(f"Live Sync: transform running but not streamed ({reason})")
 
     @staticmethod
     def _active_transform():
         """Return the running transform modal operator, if any."""
-        try:
-            operators = bpy.context.window_manager.operators
-        except (AttributeError, ReferenceError):
-            return None
-        for op in operators:
-            if getattr(op, "bl_idname", None) in TRANSFORM_OPERATORS:
-                return op
-        return None
+        return interactive_transform_active()
 
     @staticmethod
     def _active_armature():
@@ -372,23 +491,107 @@ class HostPoseStreamer:
     def tick(self, broadcaster: LiveSyncBroadcaster):
         transform = self._active_transform()
 
-        if transform is not None:
+        # The viewer's temporary keyframe follows the bone the Host has
+        # *selected*, not only the one it happens to be dragging: the README
+        # asks for the overlay at the position the Host has selected and at the
+        # Host's frame_current, so a timeline scrub has to reach viewers too.
+        # Gating on a running transform meant the overlay only ever appeared
+        # mid-drag and never followed the frame.
+        if self._stream_wanted():
             if self.state == IDLE:
                 self._begin(broadcaster)
-            elif self.state == INTERACTING:
-                self._update(broadcaster)
+            else:
+                # A viewer that joins mid-selection missed the single "start",
+                # so re-send at once rather than letting it wait out the
+                # heartbeat - otherwise the overlay shows up to a second late
+                # and every selection reads as laggy.
+                clients = broadcaster.client_count
+                joined = clients != self._last_client_count
+                self._last_client_count = clients
+
+                # "start" is broadcast once per selection, and _update stays
+                # silent while the pose is unchanged, so an already-connected
+                # viewer still needs the periodic re-send as a safety net.
+                idle = (time.monotonic() - self._last_broadcast) \
+                    >= HEARTBEAT_INTERVAL
+                self._update(broadcaster, force=joined,
+                             heartbeat=joined or idle)
         elif self.state == INTERACTING:
             self._finish(broadcaster)
+
+        # Suppressing porcelain (README 7.8) is a strictly narrower condition
+        # than streaming. A bone that is merely selected must not block an
+        # armed toggle, and neither must a transform operator left on
+        # wm.operators after the drag ended - that stack keeps finished
+        # entries, so _motion_stalled() is what tells a live drag from a
+        # leftover.
+        self.transform_active = (
+            self.state == INTERACTING
+            and transform is not None
+            and not self._motion_stalled()
+        )
+
+    def _stream_wanted(self):
+        """True while a tracked armature in Pose Mode has a bone selected."""
+        if self._active_armature() is None:
+            return False
+        return bool(bpy.context.selected_pose_bones
+                    or bpy.context.active_pose_bone)
+
+    def _motion_stalled(self):
+        """True only when the matched operator is a leftover, not a live drag.
+
+        Idleness alone must not end the stream. A real drag holds the evaluated
+        pose away from the bpy.data snapshot even while the mouse is briefly
+        still, and finishing at that point makes _finish() read the still
+        uncommitted pose as a cancellation and snap the bone back. That chopped
+        every drag into one-second end/start/update cycles and left the viewer's
+        bone appearing frozen. Only idleness *with the pose back at its
+        snapshot* proves the operator on the stack is a finished leftover.
+        """
+        if (time.monotonic() - self._last_motion) <= TRANSFORM_IDLE_TIMEOUT:
+            return False
+        return not self._pose_differs_from_snapshot()
+
+    def _pose_differs_from_snapshot(self):
+        """True while any streamed bone sits away from its bpy.data snapshot."""
+        armature = self._active_armature()
+        if armature is None:
+            return False
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            evaluated = armature.evaluated_get(depsgraph)
+        except (ReferenceError, RuntimeError):
+            return False
+
+        for bone_name, record in self._bones.items():
+            evaluated_bone = evaluated.pose.bones.get(bone_name)
+            if evaluated_bone is None:
+                continue
+            if not matrices_equal(evaluated_bone.matrix_basis,
+                                  record["original"]):
+                return True
+        return False
 
     def _begin(self, broadcaster):
         armature = self._active_armature()
         if armature is None:
+            obj = bpy.context.active_object
+            if obj is None:
+                self._log_skip("no active object")
+            elif obj.type != "ARMATURE":
+                self._log_skip(f"active object is {obj.type}, not ARMATURE")
+            elif obj.mode != "POSE":
+                self._log_skip(f"armature is in {obj.mode} mode, not POSE")
+            else:
+                self._log_skip("armature has no replication uuid")
             return
 
         bones = bpy.context.selected_pose_bones or (
             [bpy.context.active_pose_bone] if bpy.context.active_pose_bone else []
         )
         if not bones:
+            self._log_skip("no pose bone selected")
             return
 
         self.armature = armature
@@ -405,6 +608,9 @@ class HostPoseStreamer:
         }
         self.state = INTERACTING
         self._last_send = 0.0
+        # Start the idle window fresh: without this a stream could be judged
+        # stalled on the very next tick, before the drag had a chance to move.
+        self._last_motion = time.monotonic()
 
         for bone_name in self._bones:
             broadcaster.broadcast({
@@ -414,14 +620,16 @@ class HostPoseStreamer:
                 "bone_name": bone_name,
                 "frame": self.frame,
             })
-        logging.debug(
-            f"Live Sync: start on {len(self._bones)} bone(s) at frame {self.frame}"
+        logging.info(
+            f"Live Sync: start on {len(self._bones)} bone(s) "
+            f"of '{armature.name}' at frame {self.frame} "
+            f"({broadcaster.client_count} viewer(s) connected)"
         )
         # Push the first visual pose straight away so the viewer is not left
         # waiting a full update interval.
         self._update(broadcaster, force=True)
 
-    def _update(self, broadcaster, force=False):
+    def _update(self, broadcaster, force=False, heartbeat=False):
         now = time.monotonic()
         if not force and (now - self._last_send) < UPDATE_INTERVAL:
             return
@@ -450,11 +658,33 @@ class HostPoseStreamer:
             if evaluated_bone is None:
                 continue
 
-            matrix = evaluated_bone.matrix_basis.copy()
-            if not frame_changed and record["sent"] is not None \
-                    and matrices_equal(matrix, record["sent"]):
+            # Rotation travels as raw channel values, not derived from
+            # matrix_basis: a matrix cannot represent more than one full turn,
+            # so a Host euler of 270 degrees would decompose back to -90 on the
+            # viewer. Same visible pose, different stored value - and the
+            # viewer's animation then plays wrong.
+            location = tuple(evaluated_bone.location)
+            rotation_mode = evaluated_bone.rotation_mode
+            rotation = _bone_rotation_values(evaluated_bone)
+            scale = tuple(evaluated_bone.scale)
+            payload = (location, rotation_mode, rotation, scale)
+
+            # Comparing the payload rather than the matrix is what makes a
+            # change from 270 to 630 degrees count as motion at all: both
+            # produce an identical matrix_basis.
+            changed = (frame_changed or record["sent"] is None
+                       or payload != record["sent"])
+            if not changed and not heartbeat:
                 continue
-            record["sent"] = matrix
+            if changed:
+                # Real motion is the only trustworthy proof that the drag is
+                # still going, since a finished transform lingers on
+                # wm.operators. A heartbeat re-send is deliberately NOT counted
+                # as motion: doing so would keep transform_active true forever
+                # and block every armed porcelain push.
+                self._last_motion = now
+            record["sent"] = payload
+            self._last_broadcast = now
 
             broadcaster.broadcast({
                 "channel": CHANNEL,
@@ -462,7 +692,13 @@ class HostPoseStreamer:
                 "armature_uuid": self.armature_uuid,
                 "bone_name": bone_name,
                 "frame": self.frame,
-                "matrix_basis": matrix_to_lists(matrix),
+                # Still sent: the no-Action fallback drives matrix_basis
+                # directly, and a viewer on an older build reads only this.
+                "matrix_basis": matrix_to_lists(evaluated_bone.matrix_basis),
+                "location": location,
+                "rotation_mode": rotation_mode,
+                "rotation": rotation,
+                "scale": scale,
             })
 
     def _finish(self, broadcaster):
@@ -474,6 +710,7 @@ class HostPoseStreamer:
             except ReferenceError:
                 armature = None
 
+        all_cancelled = True
         for bone_name, record in self._bones.items():
             is_cancelled = True
             if armature is not None:
@@ -484,6 +721,7 @@ class HostPoseStreamer:
                     is_cancelled = matrices_equal(
                         bone.matrix_basis, record["original"]
                     )
+            all_cancelled = all_cancelled and is_cancelled
 
             broadcaster.broadcast({
                 "channel": CHANNEL,
@@ -494,8 +732,9 @@ class HostPoseStreamer:
                 "is_cancelled": is_cancelled,
             })
 
-        logging.debug(
-            f"Live Sync: end ({len(self._bones)} bone(s)) at frame {self.frame}"
+        logging.info(
+            f"Live Sync: end ({len(self._bones)} bone(s) at frame {self.frame}, "
+            f"cancelled={all_cancelled})"
         )
         self.reset()
 
@@ -505,9 +744,15 @@ class HostPoseStreamer:
 # --------------------------------------------------------------------------- #
 
 def _rotation_data_path(rotation_mode: str) -> str:
-    """F-Curve data path suffix holding a bone's rotation channels."""
+    """F-Curve data path suffix holding a bone's rotation channels.
+
+    The quaternion property is ``rotation_quaternion``, not ``rotation_quat``:
+    probed identical on Blender 4.5.2 and 5.2.2, where PoseBone has no
+    ``rotation_quat`` attribute at all. Keying the wrong path silently created
+    curves nothing evaluated, which is why quaternion rotation never synced.
+    """
     if rotation_mode == "QUATERNION":
-        return "rotation_quat"
+        return "rotation_quaternion"
     if rotation_mode == "AXIS_ANGLE":
         return "rotation_axis_angle"
     return "rotation_euler"
@@ -521,6 +766,47 @@ def _rotation_values(rotation_mode: str, quat):
         return (angle, axis.x, axis.y, axis.z)
     euler = quat.to_euler(rotation_mode)
     return (euler.x, euler.y, euler.z)
+
+
+def _bone_rotation_values(bone):
+    """The bone's raw rotation channels, in its own rotation_mode.
+
+    Read straight off the bone rather than derived from matrix_basis. A matrix
+    cannot represent more than one full turn, so a Host euler of 270 degrees
+    comes back out of decompose() as -90: the pose looks identical but the
+    stored value differs, and the viewer's animation then plays wrong.
+    """
+    mode = bone.rotation_mode
+    if mode == "QUATERNION":
+        return tuple(bone.rotation_quaternion)
+    if mode == "AXIS_ANGLE":
+        return tuple(bone.rotation_axis_angle)
+    return tuple(bone.rotation_euler)
+
+
+def _rotation_to_quaternion(rotation_mode: str, values):
+    """Rotation channel values as a quaternion, for cross-mode conversion."""
+    if rotation_mode == "QUATERNION":
+        return mathutils.Quaternion(values)
+    if rotation_mode == "AXIS_ANGLE":
+        # Blender's axis-angle is a single (angle, x, y, z) sequence, which is
+        # exactly what the Quaternion constructor accepts.
+        return mathutils.Quaternion(values)
+    return mathutils.Euler(values, rotation_mode).to_quaternion()
+
+
+def _rotation_values_for_mode(target_mode: str, source_mode: str, values):
+    """Rotation values expressed in the receiving bone's rotation_mode.
+
+    Identical modes pass straight through, which is what preserves a
+    multi-turn euler exactly. Converting between different modes has to go
+    through a quaternion and is therefore lossy past one turn - unavoidable
+    when the two peers genuinely disagree on the representation.
+    """
+    if source_mode == target_mode:
+        return tuple(values)
+    return _rotation_values(
+        target_mode, _rotation_to_quaternion(source_mode, values))
 
 
 def _find_point(fcurve, frame: float):
@@ -585,6 +871,10 @@ class _BoneEdit:
         # (data_path, array_index) for curves we had to add to the Action.
         self.created_curves = []
         self.direct_matrix = None  # set when the bone has no Action to key
+        # The rotation-mode diagnostic fires once per overlay. It cannot key
+        # off `backups` being empty: a frame change clears backups, so while
+        # the Host scrubs the timeline that would log on every single frame.
+        self.mode_logged = False
 
     @property
     def data_path_prefix(self) -> str:
@@ -603,6 +893,10 @@ class ClientPoseApplier:
         self.state = IDLE
         self._edits = {}  # (armature_uuid, bone_name) -> _BoneEdit
         self._armature_cache = {}
+        # Keys whose stream this viewer saw end. An update for one of these is
+        # a leftover in flight, not a late join, and must not resurrect the
+        # overlay: nothing would ever clean it up again.
+        self._ended = set()
 
     # -- resolution ------------------------------------------------------- #
 
@@ -662,25 +956,66 @@ class ClientPoseApplier:
     def _on_start(self, key, message):
         armature = self._resolve_armature(key[0])
         if armature is None:
-            logging.debug(f"Live Sync: ignoring start, armature {key[0]} not found")
+            logging.info(
+                f"Live Sync: ignoring start, armature {key[0]} not found locally"
+            )
             return
         if armature.pose.bones.get(key[1]) is None:
-            logging.debug(f"Live Sync: ignoring start, bone {key[1]} not found")
+            logging.info(
+                f"Live Sync: ignoring start, bone '{key[1]}' not in "
+                f"'{armature.name}'"
+            )
             return
 
         # A restart supersedes whatever was in flight for this bone.
         stale = self._edits.pop(key, None)
         if stale is not None:
             self._restore(stale)
+        self._ended.discard(key)
 
         self._edits[key] = _BoneEdit(armature, key[1], int(message.get("frame", 0)))
         self.state = INTERACTING
 
+    def _revive_overlay(self, key, message):
+        """Rebuild an overlay whose start message this viewer never received.
+
+        The Host begins the stream once, when the bone is selected, and then
+        keeps it open for as long as the selection lasts. A viewer that
+        connects after that single start - or that reconnects mid-selection -
+        would otherwise drop every update silently and show no temporary
+        keyframe at all. An update carries the armature uuid, the bone name and
+        the frame, which is everything a start provides, so the overlay can be
+        rebuilt from it.
+
+        Returns None quietly when the armature or bone is not present locally:
+        updates arrive at a high rate, so a repeated failure must not log.
+        """
+        if key in self._ended:
+            # This viewer already saw the stream end, so the update is a
+            # leftover in flight rather than a missed start. Reviving it would
+            # leave an overlay no end message will ever clean up.
+            return None
+
+        armature = self._resolve_armature(key[0])
+        if armature is None or armature.pose.bones.get(key[1]) is None:
+            return None
+
+        edit = _BoneEdit(armature, key[1], int(message.get("frame", 0)))
+        self._edits[key] = edit
+        self.state = INTERACTING
+        logging.info(
+            f"Live Sync: update arrived with no start for '{key[1]}' of "
+            f"'{armature.name}'; rebuilt the overlay at frame {edit.frame}"
+        )
+        return edit
+
     def _on_update(self, key, message):
         edit = self._edits.get(key)
         if edit is None:
-            # A start we could not honour (missing bone/armature); stay quiet.
-            return
+            edit = self._revive_overlay(key, message)
+            if edit is None:
+                # A start we could not honour (missing bone/armature); stay quiet.
+                return
 
         armature = edit.armature
         try:
@@ -694,10 +1029,10 @@ class ClientPoseApplier:
             return
 
         frame = int(message.get("frame", edit.frame))
-        rows = message.get("matrix_basis")
-        if not rows:
+        # A payload carries either the raw rotation channels or, from an older
+        # Host build, only matrix_basis. Either is enough to write the overlay.
+        if not message.get("matrix_basis") and message.get("rotation") is None:
             return
-        matrix = matrix_from_lists(rows)
 
         if frame != edit.frame:
             # Host scrubbed mid-edit: move the overlay to the new frame and
@@ -708,9 +1043,14 @@ class ClientPoseApplier:
             edit.created_curves.clear()
             edit.direct_matrix = None
 
-        self._write_pose(edit, bone, matrix)
+        self._write_pose(edit, bone, message)
 
     def _on_end(self, key, message):
+        # Record the end before anything else, including when there is no
+        # overlay to tear down: a viewer that joined late still has to know the
+        # stream is over, so the updates still in flight do not resurrect it.
+        self._ended.add(key)
+
         edit = self._edits.pop(key, None)
         if edit is None:
             return
@@ -719,6 +1059,13 @@ class ClientPoseApplier:
         # push lands right after and overwrites the frame with the committed
         # data; restoring here first is what keeps that apply from being
         # reverted by our own undo bookkeeping.
+        #
+        # Keeping the overlay on a confirm instead (message["is_cancelled"] is
+        # False) looks like the fix for "the temporary keyframe disappears",
+        # but it is not: when the push never lands the viewer is left holding a
+        # phantom keyframe forever, and the next overlay backs that phantom up
+        # as its original value, so the pose drifts on every drag. The real
+        # fault is the push being skipped, not the restore.
         self.state = RESOLVING
         self._restore(edit)
 
@@ -727,7 +1074,63 @@ class ClientPoseApplier:
 
     # -- writing ---------------------------------------------------------- #
 
-    def _write_pose(self, edit: _BoneEdit, bone, matrix):
+    @staticmethod
+    def _channel_values(bone, message: dict):
+        """Location, rotation and scale to key, in this bone's rotation_mode.
+
+        Prefers the raw channels the Host sent. Deriving rotation from
+        matrix_basis instead normalises a multi-turn euler into [-180, 180], so
+        a Host value of 270 degrees would be keyed as -90: same visible pose,
+        wrong stored value, and the animation plays incorrectly. The matrix
+        fallback stays so a viewer paired with an older Host build still works.
+        """
+        rotation = message.get("rotation")
+        rotation_mode = message.get("rotation_mode")
+        location = message.get("location")
+        scale = message.get("scale")
+
+        if (rotation is not None and rotation_mode
+                and location is not None and scale is not None):
+            return (
+                tuple(location),
+                _rotation_values_for_mode(
+                    bone.rotation_mode, rotation_mode, rotation),
+                tuple(scale),
+            )
+
+        matrix = matrix_from_lists(message.get("matrix_basis"))
+        fallback_location, fallback_rotation, fallback_scale = matrix.decompose()
+        return (
+            tuple(fallback_location),
+            _rotation_values(bone.rotation_mode, fallback_rotation),
+            tuple(fallback_scale),
+        )
+
+    @staticmethod
+    def _set_bone_transform(bone, message: dict):
+        """Drive a bone that has no keyable Action, keeping raw rotation values.
+
+        Assigning matrix_basis here would renormalise the rotation through the
+        bone's own mode, losing any turn count past 180 degrees.
+        """
+        rotation = message.get("rotation")
+        rotation_mode = message.get("rotation_mode")
+        if rotation is None or not rotation_mode:
+            bone.matrix_basis = matrix_from_lists(message.get("matrix_basis"))
+            return
+
+        bone.location = tuple(message.get("location", bone.location))
+        bone.scale = tuple(message.get("scale", bone.scale))
+        values = _rotation_values_for_mode(
+            bone.rotation_mode, rotation_mode, rotation)
+        if bone.rotation_mode == "QUATERNION":
+            bone.rotation_quaternion = values
+        elif bone.rotation_mode == "AXIS_ANGLE":
+            bone.rotation_axis_angle = values
+        else:
+            bone.rotation_euler = values
+
+    def _write_pose(self, edit: _BoneEdit, bone, message: dict):
         self._suppress_depsgraph(edit.armature)
 
         action = self._get_action(edit.armature)
@@ -737,22 +1140,40 @@ class ClientPoseApplier:
 
         if fcurves is None:
             # No Action, or no slot to key into: drive the bone directly,
-            # reversibly.
+            # reversibly. This is visible but leaves no temporary keyframe,
+            # so say which path was taken - it is the first thing to check
+            # when a viewer reports "the pose never appears".
             if edit.direct_matrix is None:
                 edit.direct_matrix = bone.matrix_basis.copy()
-            bone.matrix_basis = matrix
+                logging.info(
+                    f"Live Sync: '{edit.armature.name}' has no keyable Action "
+                    f"(action={action is not None}); driving "
+                    f"'{edit.bone_name}' directly"
+                )
+            self._set_bone_transform(bone, message)
             return
 
-        location, rotation, scale = matrix.decompose()
         prefix = edit.data_path_prefix
         rot_path = _rotation_data_path(bone.rotation_mode)
-        rot_values = _rotation_values(bone.rotation_mode, rotation)
+        location, rot_values, scale = self._channel_values(bone, message)
 
         channels = [
-            (f"{prefix}.location", tuple(location)),
+            (f"{prefix}.location", location),
             (f"{prefix}.{rot_path}", rot_values),
-            (f"{prefix}.scale", tuple(scale)),
+            (f"{prefix}.scale", scale),
         ]
+
+        if not edit.mode_logged:
+            edit.mode_logged = True
+            # Recorded once per overlay. When a viewer reports that location and
+            # scale arrive but rotation does not, the mode and the data path
+            # actually written are the first things to compare against the
+            # bone's own rotation_mode.
+            logging.info(
+                f"Live Sync: keying '{edit.bone_name}' in "
+                f"{bone.rotation_mode} mode -> {rot_path} "
+                f"({len(channels)} channel group(s) at frame {edit.frame})"
+            )
 
         for data_path, values in channels:
             for index, value in enumerate(values):
@@ -910,6 +1331,7 @@ class LiveSyncEngine:
         self.applier = ClientPoseApplier()
         self._is_host = False
         self._endpoint = None
+        self._last_tick_error_log = 0.0
 
     # -- transport -------------------------------------------------------- #
 
@@ -922,14 +1344,9 @@ class LiveSyncEngine:
         if repository is None or repository.remote is None:
             return None
 
-        try:
-            is_host = bool(bpy.data.window_managers["WinMan"].session.is_host)
-        except (KeyError, AttributeError):
-            is_host = False
-
         port = repository.remote.port + PORT_OFFSET
         address = repository.remote.address
-        return is_host, address, port
+        return is_host(), address, port
 
     def _sync_transport(self):
         endpoint = self._endpoint_for_session()
@@ -949,6 +1366,10 @@ class LiveSyncEngine:
 
         self._is_host = is_host
         self._endpoint = endpoint
+        logging.info(
+            f"Live Sync: session endpoint {address}:{port} "
+            f"(role={'HOST broadcaster' if is_host else 'VIEWER receiver'})"
+        )
         try:
             if is_host:
                 self.broadcaster = LiveSyncBroadcaster(port)
@@ -957,7 +1378,9 @@ class LiveSyncEngine:
                 self.receiver = LiveSyncReceiver(address, port)
                 self.receiver.start()
         except OSError as e:
-            logging.warning(f"Live Sync: transport unavailable ({e})")
+            logging.warning(
+                f"Live Sync: transport unavailable on {address}:{port} ({e})"
+            )
             self.shutdown()
             return False
         return True
@@ -975,7 +1398,16 @@ class LiveSyncEngine:
         except Exception as e:
             # Never let a Live Sync fault tear the whole session down: the
             # Timer base class disconnects on any exception it sees.
-            logging.debug(f"Live Sync: tick error ({e})")
+            #
+            # Logged at WARNING, throttled to one line per second (tick runs at
+            # 60 Hz). It used to be logging.debug, which never reaches the
+            # session log file at INFO level: a streamer raising on every tick
+            # was indistinguishable from one that was simply idle.
+            now = time.monotonic()
+            if now - self._last_tick_error_log >= 1.0:
+                self._last_tick_error_log = now
+                logging.warning(
+                    f"Live Sync: tick error ({e!r})", exc_info=True)
 
     def _tick(self):
         if not self._sync_transport():
@@ -1029,7 +1461,17 @@ class LiveSyncEngine:
             try:
                 self.applier.apply(message)
             except Exception as e:
-                logging.debug(f"Live Sync: bad message ignored ({e})")
+                logging.info(f"Live Sync: bad message ignored ({e!r})")
+
+        if logging.getLogger().isEnabledFor(logging.INFO):
+            kinds = {}
+            for message in batch:
+                kinds[message.get("action")] = kinds.get(message.get("action"), 0) + 1
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(kinds.items()))
+            logging.info(
+                f"Live Sync: viewer applied {len(batch) - len(superseded)}"
+                f"/{len(batch)} message(s) [{summary}]"
+            )
 
     @staticmethod
     def _runtime_settings():
@@ -1061,6 +1503,23 @@ engine = LiveSyncEngine()
 def tick():
     """Main-thread entry point, driven by timers.LiveSyncTimer."""
     engine.tick()
+
+
+def pose_stream_active():
+    """True only while a real drag is in progress, not while merely selected.
+
+    handlers.on_scene_update consults this to honour README 7.8 (no porcelain
+    during an interactive transform). It must not be the same condition as
+    "the overlay is running": the overlay now follows the selected bone so
+    viewers see timeline scrubs, and treating a mere selection as an active
+    transform would block every armed toggle for as long as the user has a
+    bone selected.
+
+    It also must not scan wm.operators here - that stack accumulates finished
+    operators, so a drag that ended minutes ago would otherwise be reported as
+    still running and suppress porcelain pushes indefinitely.
+    """
+    return engine.streamer.transform_active
 
 
 def shutdown():

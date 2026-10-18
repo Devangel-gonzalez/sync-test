@@ -17,6 +17,7 @@
 
 
 import copy
+import logging
 
 import bpy
 from bpy_extras import anim_utils
@@ -220,7 +221,15 @@ def dump_animation_data(datablock):
     animation_data = {}
     if has_action(datablock):
         animation_data['action'] = datablock.animation_data.action.uuid
-        animation_data['action_slot'] = datablock.animation_data.action_slot.identifier
+        # Blender 5 does not populate action_slot when an action is assigned,
+        # so it can legitimately be None even with an action set. Reading
+        # .identifier unconditionally raised AttributeError here; it propagated
+        # out of SessionListenTimer.execute and Timer.main turned it into a
+        # session.disconnect, so the session died the second it started.
+        # load_animation_data reads a missing slot as "leave action_slot unset".
+        action_slot = datablock.animation_data.action_slot
+        if action_slot is not None:
+            animation_data['action_slot'] = action_slot.identifier
     if has_driver(datablock):
         animation_data['drivers'] = []
         for driver in datablock.animation_data.drivers:
@@ -246,7 +255,32 @@ def load_animation_data(animation_data, datablock):
         if action:
             action = resolve_datablock_from_uuid(action, bpy.data.actions)
             datablock.animation_data.action = action
-            datablock.animation_data.action_slot = action.slots[animation_data['action_slot']]
+            # Blender 5 does not populate action_slot when the action is
+            # assigned, so it has to be set explicitly. The slot can still be
+            # legitimately absent, or target an incompatible id-type, and
+            # raising here aborts the whole apply: the datablock is then left
+            # unlinked from an action whose slots were already rebuilt, which
+            # is how an armature ends up showing no keyframes at all.
+            slot_id = animation_data.get('action_slot')
+            slot = action.slots.get(slot_id) if slot_id else None
+            if slot is None and len(action.slots) == 1:
+                # The dumped identifier did not survive the rebuild, but with a
+                # single slot there is no ambiguity about which one to use.
+                # Leaving action_slot unset is what makes an armature keep its
+                # action yet display no keyframes at all.
+                slot = action.slots[0]
+            if slot is None:
+                logging.warning(
+                    f"Action slot '{slot_id}' missing on '{action.name}', "
+                    f"leaving action_slot unset")
+            else:
+                try:
+                    datablock.animation_data.action_slot = slot
+                except (RuntimeError, TypeError) as e:
+                    logging.warning(
+                        f"Cannot assign action slot '{slot_id}' of "
+                        f"'{action.name}' to "
+                        f"'{getattr(datablock, 'name', datablock)}': {e!r}")
         elif datablock.animation_data.action:
             datablock.animation_data.action = None
 
@@ -260,6 +294,23 @@ def resolve_animation_dependencies(datablock):
         return [datablock.animation_data.action]
     else:
         return []
+
+
+def count_action_curves(action):
+    """Total number of F-Curves an action currently holds.
+
+    Blender 5 moved curves into a per-slot channelbag and removed
+    ``Action.fcurves``, so counting has to go through the slots there. A slot
+    without a channelbag simply contributes nothing.
+    """
+    if bpy.app.version >= (5, 0, 0):
+        total = 0
+        for slot in action.slots:
+            channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
+            if channelbag is not None:
+                total += len(channelbag.fcurves)
+        return total
+    return len(action.fcurves)
 
 
 class BlAction(ReplicatedDatablock):
@@ -277,11 +328,34 @@ class BlAction(ReplicatedDatablock):
 
     @staticmethod
     def load(data: dict, datablock: object):
+        # Clearing the slots first and rebuilding them second means an incoming
+        # dump that carries no curve erases every keyframe the local action
+        # already had, and the peer receiving it cannot get them back. Counting
+        # curves rather than slots matters: a payload with a slot whose
+        # "fcurves" list is empty passes a slot-presence check and still wipes
+        # the action, without logging anything.
+        incoming_slots = data.get('slots') or {}
+        incoming_curves = sum(
+            len(slot.get('fcurves') or []) for slot in incoming_slots.values()
+        ) + len(data.get('fcurves') or [])
+
+        if incoming_curves == 0:
+            local_curves = count_action_curves(datablock)
+            if local_curves:
+                logging.warning(
+                    f"Action '{getattr(datablock, 'name', datablock)}' received "
+                    f"0 curves but already holds {local_curves}; keeping the "
+                    f"existing keyframes instead of wiping them")
+                return
+
         # Load slots
-        for slot in datablock.slots:
+        # Snapshot before removing: mutating a bpy_prop_collection while it is
+        # being iterated skips entries, and a half-cleared action silently
+        # loses the curves that were not rebuilt.
+        for slot in list(datablock.slots):
             datablock.slots.remove(slot)
 
-        for slot in data['slots'].values():
+        for slot in incoming_slots.values():
             new_slot = datablock.slots.new(slot['target_id_type'], slot['name_display'])
 
             if bpy.app.version >= (5,0,0):
@@ -353,6 +427,14 @@ class BlAction(ReplicatedDatablock):
             for slot in datablock.slots:
                 channelbag = anim_utils.action_get_channelbag_for_slot(datablock, slot)
                 data['slots'][slot.identifier]["fcurves"] = []
+                if channelbag is None:
+                    # A slot without a channelbag holds no curve. Reading
+                    # .fcurves on None raised AttributeError, which escaped the
+                    # timer and disconnected the whole session.
+                    logging.warning(
+                        f"Action '{datablock.name}' slot '{slot.identifier}' "
+                        f"has no channelbag; dumping it empty")
+                    continue
                 for fcurve in channelbag.fcurves:
                     data['slots'][slot.identifier]["fcurves"].append(dump_fcurve(fcurve, use_numpy=True))
         else:

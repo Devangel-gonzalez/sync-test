@@ -215,6 +215,9 @@ def on_connection_end(reason="none"):
     # so tear it down explicitly to avoid orphan sockets or temp keyframes.
     live_sync.shutdown()
     shared_data.session.live_sync_nodes.clear()
+    # The role is per-session: without this reset a former Host who then joins
+    # somebody else's session would still pick the broadcaster transport role.
+    bpy.context.window_manager.session.is_host = False
 
     stop_modal_executor = True
 
@@ -440,6 +443,12 @@ class SessionHostOperator(bpy.types.Operator):
                 message=f"{e}"
             )
             return {"CANCELLED"}
+
+        # Hosting is what makes this peer the broadcaster: the live sync
+        # engine reads session.is_host to decide whether to open a broadcaster
+        # socket and stream poses, or to only ever act as a viewer. Without
+        # this the Host streams nothing and no client receives live poses.
+        context.window_manager.session.is_host = True
 
         # Background client updates service
         setup_timer()
@@ -828,7 +837,7 @@ class SessionToggleLiveSync(bpy.types.Operator):
 
         if live_sync_nodes.get(self.target, False):
             live_sync_nodes.pop(self.target, None)
-            logging.debug(f"Live Sync: disarmed {self.target}")
+            logging.info(f"Live Sync: disarmed {self.target}")
             return {"FINISHED"}
 
         # Arm the node, but only once the immediate push it promises succeeds.
@@ -840,7 +849,7 @@ class SessionToggleLiveSync(bpy.types.Operator):
             return {"CANCELLED"}
 
         live_sync_nodes[self.target] = True
-        logging.debug(f"Live Sync: armed {self.target}")
+        logging.info(f"Live Sync: armed {self.target}")
         return {"FINISHED"}
 
 

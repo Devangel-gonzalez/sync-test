@@ -139,9 +139,20 @@ class ApplyTimer(Timer):
                     try:
                         shared_data.session.applied_updates.append(node)
                         porcelain.apply(session.repository, node)
-                    except Exception:
-                        logging.error(f"Fail to apply {node_ref.uuid}")
-                        traceback.print_exc()
+                    except Exception as e:
+                        # Drop the marker added above. The node stays FETCHED and
+                        # is retried on every tick, so a failed apply that left
+                        # its uuid behind poisons applied_updates: from then on
+                        # on_scene_update mistakes the user's own edits to that
+                        # node for incoming remote data and skips the commit/push.
+                        try:
+                            shared_data.session.applied_updates.remove(node)
+                        except ValueError:
+                            pass
+                        # exc_info so the traceback lands in the session log file
+                        # and not only on the console.
+                        logging.error(
+                            f"Fail to apply {node_ref.uuid}: {e!r}", exc_info=True)
                     else:
                         impl = session.repository.rdp.get_implementation(node_ref.instance)
                         if impl.bl_reload_parent:
@@ -224,75 +235,18 @@ class DynamicRightSelectTimer(Timer):
                     bpy.data.window_managers['WinMan'].windows[0].view_layer
                 ))
                 if current_selection != self._last_selection:
-                    to_lock = list(current_selection.difference(self._last_selection))
-                    to_release = list(self._last_selection.difference(current_selection))
-                    instances_to_lock = list()
-
-                    for node_id in to_lock:
-                        node = session.repository.graph.get(node_id)
-                        if node and hasattr(node,'data'):
-                            instance_mode = node.data.get('instance_type')
-                            if instance_mode and instance_mode == 'COLLECTION':
-                                to_lock.remove(node_id)
-                                instances_to_lock.append(node_id)
-                    if instances_to_lock:
-                        try:
-                            porcelain.lock(
-                                session.repository,
-                                instances_to_lock,
-                                ignore_warnings=True,
-                                affect_dependencies=False,
-                            )
-                        except NonAuthorizedOperationError as e:
-                            logging.warning(e)
-
-                    if to_release:
-                        try:
-                            porcelain.unlock(
-                                session.repository,
-                                to_release,
-                                ignore_warnings=True,
-                                affect_dependencies=True,
-                            )
-                        except NonAuthorizedOperationError as e:
-                            logging.warning(e)
-                    if to_lock:
-                        try:
-                            porcelain.lock(
-                                session.repository,
-                                to_lock,
-                                ignore_warnings=True,
-                                affect_dependencies=True,
-                            )
-                        except NonAuthorizedOperationError as e:
-                            logging.warning(e)
-
                     self._last_selection = current_selection
 
+                    # The selection is published, never locked. Several users
+                    # must be able to have the same object selected at the same
+                    # time; this metadata feed is what the presence overlay of
+                    # the other peers draws from, so it has to keep flowing.
                     user_metadata = {
                         'selected_objects': current_selection
                     }
 
                     porcelain.update_user_metadata(session.repository, user_metadata)
                     logging.debug("Update selection")
-
-                    # Fix deselection until right managment refactoring (with Roles concepts)
-                    if len(current_selection) == 0:
-                        owned_keys = [
-                            k
-                            for k, v in session.repository.graph.items()
-                            if v.owner == settings.username
-                        ]
-                        if owned_keys:
-                            try:
-                                porcelain.unlock(
-                                    session.repository,
-                                    owned_keys,
-                                    ignore_warnings=True,
-                                    affect_dependencies=True,
-                                )
-                            except NonAuthorizedOperationError as e:
-                                logging.warning(e)
 
             # Objects selectability
             for obj in bpy.data.objects:
@@ -301,7 +255,15 @@ class DynamicRightSelectTimer(Timer):
                     is_selectable = not session.repository.is_node_readonly(object_uuid)
                     if obj.hide_select != is_selectable:
                         obj.hide_select = is_selectable
-                        shared_data.session.applied_updates.append(object_uuid)
+                        # Deliberately no applied_updates marker here.
+                        # hide_select is absent from BlObject.dump's
+                        # include_filter, so this is a local-only change that is
+                        # never pushed and has no echo to suppress. The marker
+                        # used to linger (a display flag need not tag the
+                        # depsgraph, so nothing consumed it) and on_scene_update
+                        # then classified the user's own next edit to that
+                        # object as incoming remote data and skipped the
+                        # commit/push: an armed toggle silently stopped pushing.
 
 
 class ClientUpdate(Timer):

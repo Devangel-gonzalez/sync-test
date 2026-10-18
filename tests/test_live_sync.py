@@ -486,7 +486,18 @@ def test_edge_cases(bpy, live_sync):
     })
     check(not applier._edits, "unknown bone ignored without tracking")
 
-    # Update with no preceding start.
+    # An update still in flight after the stream ended must not resurrect the
+    # overlay: no further end would ever clean it up. An update with neither a
+    # start nor an end is a different case - a viewer that joined late - and is
+    # covered by test_update_without_start.
+    applier.apply({
+        "channel": "live_sync", "action": "start",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
+    })
+    applier.apply({
+        "channel": "live_sync", "action": "end",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
+    })
     applier.apply({
         "channel": "live_sync", "action": "update",
         "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
@@ -497,7 +508,8 @@ def test_edge_cases(bpy, live_sync):
         len(fc.keyframe_points) == 2
         for fc in action_fcurves(bpy, action, armature)
     )
-    check(untouched, "stray update without start changes nothing")
+    check(untouched, "an update after end does not resurrect the overlay")
+    check(not applier._edits, "no overlay tracked after a rejected revival")
 
     applier.cleanup()
 
@@ -557,6 +569,651 @@ def test_streamer_idle(bpy, live_sync):
     check(streamer.state == live_sync.IDLE, "reset returns to IDLE")
 
 
+class _FakeItem:
+    def __init__(self, uuid):
+        self.uuid = uuid
+
+
+class _RecordingLayout:
+    """Stands in for a UILayout: records which operator got drawn."""
+
+    def __init__(self):
+        self.calls = []
+
+    def operator(self, idname, **kwargs):
+        self.calls.append((idname, kwargs))
+        return _OpProxy()
+
+
+class _OpProxy:
+    pass
+
+
+def _drawn_commit_operator(bpy, ui, is_host, global_live_sync):
+    runtime = bpy.context.window_manager.session
+    runtime.is_host = is_host
+    runtime.global_live_sync = global_live_sync
+
+    layout = _RecordingLayout()
+    ui.draw_commit_control(layout, _FakeItem("some-uuid"), icon="IPO_CONSTANT")
+    return layout.calls[0]
+
+
+def test_toggle_draw_rules(bpy, multi_user, live_sync):
+    """The master toggle alone decides whether datablock buttons arm."""
+    section("Live Sync toggles follow the master toggle")
+
+    runtime = bpy.context.window_manager.session
+    original_is_host = runtime.is_host
+    original_global = runtime.global_live_sync
+
+    from multi_user import ui
+
+    try:
+        check(live_sync.is_host() is False, "is_host() is False by default")
+        check(
+            live_sync.interactive_transform_active() is None,
+            "no interactive transform detected while idle",
+        )
+
+        # The streamer and handlers.on_scene_update must agree on one signal,
+        # otherwise README 7.8 and the pose stream drift apart. handlers asks
+        # for the streamer's live state instead of scanning wm.operators,
+        # because that stack accumulates finished operators and would report a
+        # drag that ended minutes ago as still in progress.
+        sentinel = object()
+        real_predicate = live_sync.interactive_transform_active
+        live_sync.interactive_transform_active = lambda: sentinel
+        try:
+            check(
+                live_sync.HostPoseStreamer._active_transform() is sentinel,
+                "streamer uses the shared transform predicate",
+            )
+        finally:
+            live_sync.interactive_transform_active = real_predicate
+
+        streamer = live_sync.engine.streamer
+        real_state = streamer.state
+        real_transform = streamer.transform_active
+        try:
+            # The overlay now also runs while a bone is merely selected, so
+            # INTERACTING alone must not suppress porcelain: that would block
+            # every armed toggle for as long as the user has a bone selected.
+            streamer.state = live_sync.INTERACTING
+            streamer.transform_active = False
+            check(
+                live_sync.pose_stream_active() is False,
+                "a selected-but-not-dragged bone does not suppress porcelain",
+            )
+            streamer.transform_active = True
+            check(
+                live_sync.pose_stream_active() is True,
+                "pose_stream_active() is True only during a real drag",
+            )
+        finally:
+            streamer.state = real_state
+            streamer.transform_active = real_transform
+
+        op_class = multi_user.operators.SessionToggleLiveSync
+
+        # README 4.8: arming is offered to any peer, Host or viewer alike. What
+        # actually limits a push is ownership, enforced in on_scene_update.
+        runtime.global_live_sync = False
+        check(
+            bool(op_class.poll(bpy.context)) is True,
+            "toggle operator stays pollable with the master toggle off",
+        )
+        runtime.global_live_sync = True
+        check(
+            bool(op_class.poll(bpy.context)) is True,
+            "toggle operator stays pollable with the master toggle on",
+        )
+
+        # README 4.8: the master toggle alone picks toggle vs vanilla button,
+        # whatever this peer's role in the session.
+        for is_host in (True, False):
+            role = "Host" if is_host else "viewer"
+
+            idname, kwargs = _drawn_commit_operator(bpy, ui, is_host, True)
+            check(
+                idname == "wm.session_toggle_live_sync",
+                f"{role} with Live Sync on draws the armed toggle",
+            )
+            check(
+                "depress" in kwargs,
+                f"{role} armed toggle carries a depress state",
+            )
+
+            idname, kwargs = _drawn_commit_operator(bpy, ui, is_host, False)
+            check(
+                idname == "wm.session_datablock_commit",
+                f"{role} with Live Sync off draws the vanilla commit button",
+            )
+            check(
+                "depress" not in kwargs,
+                f"{role} vanilla button is not a toggle",
+            )
+    finally:
+        runtime.is_host = original_is_host
+        runtime.global_live_sync = original_global
+
+
+class _FakeNode:
+    def __init__(self, uuid, type_id, owner, state=None):
+        self.uuid = uuid
+        self.data = {"type_id": type_id} if type_id else None
+        self.owner = owner
+        # replication node states: ADDED=0, COMMITED=1, PUSHED=2, FETCHED=3,
+        # UP=4. push_animation_dependencies reads this to tell whether
+        # porcelain.commit can accept the node at all.
+        self.state = 4 if state is None else state
+
+
+class _FakeGraph:
+    def __init__(self, nodes, deps):
+        self._nodes = nodes
+        self._deps = deps
+
+    def get(self, uuid):
+        return self._nodes.get(uuid)
+
+    def keys(self):
+        return self._nodes.keys()
+
+    def rbfs_from(self, uuid):
+        return reversed([uuid] + self._deps.get(uuid, []))
+
+
+class _FakeRepository:
+    def __init__(self, graph, username):
+        self.graph = graph
+        self.username = username
+
+
+def test_failed_apply_leaves_no_stale_marker(multi_user):
+    """A failed apply must not poison applied_updates.
+
+    The node stays FETCHED, so ApplyTimer retries it on every tick. A uuid left
+    behind by a failed apply makes on_scene_update mistake the user's own later
+    edits to that node for an incoming remote echo, which is what turned armed
+    live-sync toggles back into one-shot buttons.
+    """
+    section("Failed apply leaves no stale marker")
+
+    import logging
+
+    from replication.constants import FETCHED, STATE_ACTIVE
+
+    from multi_user import shared_data, timers
+
+    node = _FakeNode("stuck-uuid", "Object", "host-user")
+    node.state = FETCHED
+    graph = _FakeGraph({"stuck-uuid": node}, {})
+
+    class _FakeSession:
+        state = STATE_ACTIVE
+        repository = _FakeRepository(graph, "host-user")
+
+    class _FailingPorcelain:
+        @staticmethod
+        def apply(repository, uuid, force=False):
+            raise RuntimeError("simulated apply failure")
+
+    real_session = timers.session
+    real_porcelain = timers.porcelain
+    saved_markers = list(shared_data.session.applied_updates)
+    logger = logging.getLogger()
+    saved_level = logger.level
+
+    timers.session = _FakeSession
+    timers.porcelain = _FailingPorcelain
+    shared_data.session.applied_updates.clear()
+    # The fix logs the traceback with exc_info; keep it out of the harness output.
+    logger.setLevel(logging.CRITICAL)
+    try:
+        timer = timers.ApplyTimer()
+        timer.execute()
+        after_first = list(shared_data.session.applied_updates)
+        timer.execute()
+        after_retry = list(shared_data.session.applied_updates)
+    finally:
+        logger.setLevel(saved_level)
+        timers.session = real_session
+        timers.porcelain = real_porcelain
+        shared_data.session.applied_updates[:] = saved_markers
+
+    check(after_first == [], "a failed apply leaves no marker behind")
+    check(
+        after_retry == [],
+        "retrying a failed apply does not accumulate markers",
+    )
+
+
+def test_animation_dependency_push(multi_user):
+    """An armed push must reach the Action behind the datablock.
+
+    porcelain.commit only queues dependencies still in ADDED, so an Action
+    sitting in UP with brand new keyframes is never published on its own.
+    """
+    section("Armed push reaches the Action dependency")
+
+    from multi_user import handlers
+
+    owner = "host-user"
+    obj_node = _FakeNode("obj-uuid", "Object", owner)
+    nodes = {
+        "obj-uuid": obj_node,
+        "action-uuid": _FakeNode("action-uuid", "Action", owner),
+        "common-action": _FakeNode("common-action", "Action", handlers.RP_COMMON),
+        "foreign-action": _FakeNode("foreign-action", "Action", "someone-else"),
+        "mesh-uuid": _FakeNode("mesh-uuid", "Mesh", owner),
+        # COMMITED: what an Action looks like after a commit whose push was
+        # interrupted. porcelain.commit refuses this state, but porcelain.push
+        # accepts exactly this one, so it still publishes as a delta.
+        "stuck-action": _FakeNode("stuck-action", "Action", owner, state=1),
+        # FETCHED: genuinely stranded. Neither commit nor an unforced push
+        # accepts it, so this is the only case that may use force.
+        "stranded-action": _FakeNode("stranded-action", "Action", owner, state=3),
+    }
+    graph = _FakeGraph(
+        nodes,
+        {"obj-uuid": ["action-uuid", "common-action", "foreign-action",
+                      "mesh-uuid", "stuck-action", "stranded-action"]},
+    )
+
+    calls = []
+
+    class _FakePorcelain:
+        @staticmethod
+        def commit(repository, uuid):
+            calls.append(("commit", uuid))
+
+        @staticmethod
+        def push(repository, remote, uuid, force=False):
+            calls.append(("push", uuid, force))
+
+    real_porcelain = handlers.porcelain
+    real_repository = handlers.session.repository
+    handlers.porcelain = _FakePorcelain
+    handlers.session.repository = _FakeRepository(graph, owner)
+    try:
+        handlers.push_animation_dependencies(obj_node)
+    finally:
+        handlers.porcelain = real_porcelain
+        handlers.session.repository = real_repository
+
+    # calls mixes 2-tuples (commit) with 3-tuples (push), so filter before
+    # unpacking rather than assuming one shape.
+    pushes = [entry for entry in calls if entry[0] == "push"]
+    pushed = [entry[1] for entry in pushes]
+
+    check(("commit", "action-uuid") in calls, "owned Action dependency committed")
+    check("action-uuid" in pushed, "owned Action dependency published")
+    check(
+        "common-action" in pushed,
+        "common-owned Action dependency published",
+    )
+    check(
+        "foreign-action" not in pushed,
+        "Action owned by another user is left alone",
+    )
+    check("mesh-uuid" not in pushed, "non-Action dependencies are left alone")
+    check(
+        "obj-uuid" not in pushed,
+        "the node itself is not re-published by the helper",
+    )
+    forced = {entry[1] for entry in pushes if entry[2]}
+    unforced = {entry[1] for entry in pushes if not entry[2]}
+
+    # Only a node that neither commit nor an unforced push accepts may be
+    # forced. A forced push sends the whole node instead of the delta commit,
+    # and every viewer then rebuilds the Action through BlAction.load, which
+    # destroys the temporary keyframe the pose streamer just wrote.
+    check(
+        forced == {"stranded-action"},
+        "only a genuinely stranded Action is force-pushed",
+    )
+    check(
+        {"action-uuid", "common-action", "stuck-action"} <= unforced,
+        "committable Actions push as deltas, not full payloads",
+    )
+
+
+def test_update_without_start(bpy, live_sync):
+    """An update that arrives with no start must still build the overlay.
+
+    The Host begins the stream once, when the bone is selected, and keeps it
+    open for as long as the selection lasts. A viewer that connects after that
+    single start would otherwise drop every update and never show a temporary
+    keyframe. A real session log showed exactly that: dozens of
+    "viewer applied 1/N message(s) [update=N]" over ~40 seconds with no keying
+    line at all, until a start finally arrived 10 seconds before the session
+    ended.
+    """
+    section("Update without a start")
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+    applier = live_sync.ClientPoseApplier()
+
+    matrix = [[1, 0, 0, 4.0], [0, 1, 0, 5.0], [0, 0, 1, 6.0], [0, 0, 0, 1]]
+
+    applier.apply({
+        "channel": "live_sync", "action": "update",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
+        "matrix_basis": matrix,
+    })
+
+    check(
+        applier.state == live_sync.INTERACTING,
+        "an update with no start still opens the overlay",
+    )
+
+    fcurve = action_fcurves(bpy, action, armature).find(
+        'pose.bones["Bone"].location', index=0)
+    value = None
+    if fcurve is not None:
+        for point in fcurve.keyframe_points:
+            if abs(point.co.x - 30) < 0.5:
+                value = point.co.y
+    check(
+        value is not None and abs(value - 4.0) < 1e-4,
+        "temp keyframe written from the revived overlay",
+    )
+
+
+def test_client_timeline_is_never_altered(bpy, live_sync):
+    """README 3.1 and 7.1: the viewer's timeline must never be touched.
+
+    The temporary keyframe is written at the Host's editing frame while the
+    viewer's own playhead keeps running its independent loop, so the reviewer
+    sees the edit in context when their loop reaches that frame. Following the
+    Host's frame by assigning scene.frame_current was implemented once and
+    destroyed the point of the addon - two independent timelines - so it is
+    pinned here.
+    """
+    section("Client timeline is never altered")
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+    applier = live_sync.ClientPoseApplier()
+    scene = bpy.context.scene
+
+    scene.frame_current = 5
+    matrix = [[1, 0, 0, 4.0], [0, 1, 0, 5.0], [0, 0, 1, 6.0], [0, 0, 0, 1]]
+
+    applier.apply({
+        "channel": "live_sync", "action": "start",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 38,
+    })
+    applier.apply({
+        "channel": "live_sync", "action": "update",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 38,
+        "matrix_basis": matrix,
+    })
+    check(scene.frame_current == 5, "viewer frame_current untouched by an overlay")
+
+    def keyframe_at(frame):
+        fcurve = action_fcurves(bpy, action, armature).find(
+            'pose.bones["Bone"].location', index=0)
+        if fcurve is None:
+            return None
+        for point in fcurve.keyframe_points:
+            if abs(point.co.x - frame) < 0.5:
+                return point.co.y
+        return None
+
+    check(
+        keyframe_at(38) is not None,
+        "overlay is written at the Host's frame, not the viewer's",
+    )
+
+    # A Host scrub moves the overlay to the new frame and still must not move
+    # the viewer's playhead.
+    applier.apply({
+        "channel": "live_sync", "action": "update",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 41,
+        "matrix_basis": matrix,
+    })
+    check(scene.frame_current == 5, "viewer frame_current untouched by a Host scrub")
+    check(keyframe_at(41) is not None, "overlay followed the Host's scrub")
+    check(
+        not hasattr(live_sync.ClientPoseApplier, "_follow_frame"),
+        "no frame-follow helper exists on the applier",
+    )
+
+    applier.cleanup()
+
+
+def test_heartbeat_resends_unchanged_pose(bpy, live_sync):
+    """An idle stream must re-send the pose so a late viewer can revive.
+
+    "start" is broadcast only once per selection and _update stays silent while
+    the pose is unchanged, so without a heartbeat a viewer that connects
+    afterwards receives nothing until the Host next moves a bone. A real
+    session log showed exactly that: the viewer connected, then got its first
+    message 18 seconds later, only once the Host started transforming.
+    """
+    section("Heartbeat re-sends an unchanged pose")
+
+    armature = build_scene(bpy, with_action=True)
+    streamer = live_sync.HostPoseStreamer()
+
+    sent = []
+
+    class _FakeBroadcaster:
+        client_count = 1
+
+        def broadcast(self, message):
+            sent.append(message)
+
+    def updates():
+        return len([m for m in sent if m["action"] == "update"])
+
+    streamer.armature = armature
+    streamer.armature_uuid = "test-armature-uuid"
+    streamer.frame = bpy.context.scene.frame_current
+    streamer._bones = {
+        "Bone": {
+            "original": armature.pose.bones["Bone"].matrix_basis.copy(),
+            "sent": None,
+        },
+    }
+    streamer.state = live_sync.INTERACTING
+
+    broadcaster = _FakeBroadcaster()
+    real_active = live_sync.HostPoseStreamer._active_armature
+    live_sync.HostPoseStreamer._active_armature = staticmethod(lambda: armature)
+    try:
+        streamer._update(broadcaster, force=True)
+        first = updates()
+        check(first == 1, "the first update is broadcast")
+
+        streamer._update(broadcaster, force=True)
+        check(updates() == first, "an unchanged pose is not re-broadcast")
+
+        streamer._update(broadcaster, force=True, heartbeat=True)
+        check(updates() == first + 1, "a heartbeat re-broadcasts the unchanged pose")
+
+        # A heartbeat is not motion: counting it as such would keep
+        # transform_active true forever and block every armed porcelain push.
+        motion_before = streamer._last_motion
+        streamer._update(broadcaster, force=True, heartbeat=True)
+        check(
+            streamer._last_motion == motion_before,
+            "a heartbeat does not count as motion",
+        )
+    finally:
+        # Reading a staticmethod off the class yields the plain function, so it
+        # has to be re-wrapped: assigning it bare would turn it into an
+        # instance method and every later self._active_armature() call would
+        # pass an argument it does not accept.
+        live_sync.HostPoseStreamer._active_armature = staticmethod(real_active)
+
+
+def test_action_delta_detects_moved_keyframe(bpy, multi_user):
+    """A moved keyframe must register as a change to porcelain.
+
+    BlAction defines neither needs_update nor compute_delta, so it inherits the
+    base compute_delta: a plain DeepDiff over the dump. But dump_fcurve stores
+    keyframe_points through np_dump_collection, i.e. as numpy. If DeepDiff
+    cannot see inside those arrays, porcelain.commit finds no diff, the node
+    never reaches COMMITED, nothing is pushed - and moving a keyframe in the
+    Dope Sheet silently never reaches the viewers. A real Host log showed
+    exactly that: zero "committed Action" lines across 3.5 minutes of editing,
+    and zero "Commit skipped" warnings either.
+    """
+    section("Action delta detects a moved keyframe")
+
+    from multi_user.bl_types import bl_action
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+
+    before = bl_action.BlAction.dump(action)
+
+    fcurve = action_fcurves(bpy, action, armature).find(
+        'pose.bones["Bone"].location', index=0)
+    # check() returns None, so the guard has to be a separate statement.
+    check(fcurve is not None, "test scene exposes a location curve")
+    if fcurve is None:
+        return
+
+    point = fcurve.keyframe_points[0]
+    original_x = float(point.co.x)
+    point.co.x = original_x + 7.0
+    point.handle_left.x = float(point.handle_left.x) + 7.0
+    point.handle_right.x = float(point.handle_right.x) + 7.0
+    fcurve.update()
+
+    after = bl_action.BlAction.dump(action)
+
+    delta = bl_action.BlAction.compute_delta(before, after)
+    check(bool(delta.diff), "moving a keyframe produces a non-empty delta")
+
+
+def test_can_publish_common_nodes(multi_user):
+    """Only the Host may push a COMMON-owned node.
+
+    porcelain.assert_modification_rights accepts RP_COMMON for any peer, so
+    ownership alone cannot express the rule that the Client never commits or
+    pushes. And because every node added without an explicit owner is COMMON
+    while BlAction declares bl_check_common = False, the old gate let *nobody*
+    publish a keyframe edit - which is why moving, inserting and deleting
+    keyframes never reached the viewer.
+    """
+    section("Publish rights on COMMON nodes")
+
+    from multi_user import handlers
+
+    common = handlers.RP_COMMON
+    username = "Host"
+
+    owned = _FakeNode("owned", "Action", username)
+    common_action = _FakeNode("common-action", "Action", common)
+    foreign = _FakeNode("foreign", "Action", "someone-else")
+
+    check(
+        handlers.can_publish(owned, username, False, False),
+        "a node owned by this peer is publishable",
+    )
+    check(
+        handlers.can_publish(common_action, username, False, True),
+        "the Host may publish a COMMON node",
+    )
+    check(
+        not handlers.can_publish(common_action, "Cliente", False, False),
+        "a viewer may not publish a COMMON node",
+    )
+    check(
+        not handlers.can_publish(foreign, username, False, True),
+        "another peer's node is not publishable, not even by the Host",
+    )
+    check(
+        handlers.can_publish(foreign, username, True, False),
+        "bl_check_common types stay publishable as before",
+    )
+    check(
+        not handlers.can_publish(None, username, True, True),
+        "a missing node is never publishable",
+    )
+
+
+def test_multi_turn_rotation_is_preserved(bpy, live_sync):
+    """A Host euler past 180 degrees must be keyed as-is on the viewer.
+
+    matrix_basis cannot represent more than one full turn, so deriving the
+    rotation from it normalised 270 degrees into -90. The visible pose is
+    identical but the stored value is not, and the viewer's animation then
+    plays wrong - the exact symptom reported from a real session.
+    """
+    section("Multi-turn rotation is preserved")
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+    applier = live_sync.ClientPoseApplier()
+    bone = armature.pose.bones["Bone"]
+    bone.rotation_mode = "XYZ"
+
+    two_seventy = 4.712388980384690     # 270 degrees, past one half turn
+    minus_ninety = -1.5707963267948966  # what decomposing a matrix would give
+    identity = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+
+    applier.apply({
+        "channel": "live_sync", "action": "start",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
+    })
+    applier.apply({
+        "channel": "live_sync", "action": "update",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
+        "matrix_basis": identity,
+        "location": (0.0, 0.0, 0.0),
+        "rotation_mode": "XYZ",
+        "rotation": (two_seventy, 0.0, 0.0),
+        "scale": (1.0, 1.0, 1.0),
+    })
+
+    fcurve = action_fcurves(bpy, action, armature).find(
+        'pose.bones["Bone"].rotation_euler', index=0)
+    value = None
+    if fcurve is not None:
+        for point in fcurve.keyframe_points:
+            if abs(point.co.x - 30) < 0.5:
+                value = point.co.y
+
+    check(value is not None, "rotation_euler channel was keyed")
+    if value is not None:
+        check(
+            abs(value - two_seventy) < 1e-6,
+            "270 degrees is keyed as 270, not normalised to -90",
+        )
+        check(
+            abs(value - minus_ninety) > 1e-6,
+            "the keyed value is not the matrix-decomposed one",
+        )
+
+    # A payload from an older Host carries only the matrix, and must still work.
+    applier.apply({
+        "channel": "live_sync", "action": "update",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 31,
+        "matrix_basis": identity,
+    })
+    # Re-resolve the curve: the frame change above ran _restore(), which removes
+    # the curves the overlay had created, and _write_pose then builds new ones.
+    # The wrapper held from before that points at a removed curve - on 5.2 it
+    # reads empty, which made this check fail while the code was correct.
+    legacy_curve = action_fcurves(bpy, action, armature).find(
+        'pose.bones["Bone"].rotation_euler', index=0)
+    legacy = None
+    if legacy_curve is not None:
+        for point in legacy_curve.keyframe_points:
+            if abs(point.co.x - 31) < 0.5:
+                legacy = point.co.y
+    check(legacy is not None, "a matrix-only payload still keys the overlay")
+
+    applier.cleanup()
+
+
 def ensure_addon_entry(bpy, module_name):
     """Make the package look like an enabled addon to preferences.
 
@@ -602,7 +1259,16 @@ def main():
         test_pose_overlay(bpy, live_sync)
         test_overwrite_and_restore(bpy, live_sync)
         test_edge_cases(bpy, live_sync)
+        test_update_without_start(bpy, live_sync)
+        test_heartbeat_resends_unchanged_pose(bpy, live_sync)
+        test_client_timeline_is_never_altered(bpy, live_sync)
         test_streamer_idle(bpy, live_sync)
+        test_toggle_draw_rules(bpy, multi_user, live_sync)
+        test_failed_apply_leaves_no_stale_marker(multi_user)
+        test_animation_dependency_push(multi_user)
+        test_action_delta_detects_moved_keyframe(bpy, multi_user)
+        test_can_publish_common_nodes(multi_user)
+        test_multi_turn_rotation_is_preserved(bpy, live_sync)
     except Exception:
         traceback.print_exc()
         _failures.append("unhandled exception (see traceback above)")
