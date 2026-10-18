@@ -377,14 +377,25 @@ class BlAction(ReplicatedDatablock):
         keys_before = count_action_keyframes(datablock)
 
         # Load slots
-        # Snapshot before removing: mutating a bpy_prop_collection while it is
-        # being iterated skips entries, and a half-cleared action silently
-        # loses the curves that were not rebuilt.
-        for slot in list(datablock.slots):
-            datablock.slots.remove(slot)
+        # Reuse the slots that already exist instead of removing them all and
+        # rebuilding. Tearing them down left the armature with no evaluable
+        # animation between the removal and the rebuild, and because this runs
+        # on every apply the bone visibly froze. Reuse also keeps the channelbag
+        # alive, so a pose overlay holding fcurve wrappers is not invalidated.
+        #
+        # Slots are matched on (target_id_type, name_display): the identifier
+        # cannot be used because slots.new() mints a fresh one, so an identifier
+        # never survives a round trip.
+        available = {}
+        for existing in datablock.slots:
+            available.setdefault(
+                (existing.target_id_type, existing.name_display),
+                []).append(existing)
 
         for slot in incoming_slots.values():
-            new_slot = datablock.slots.new(slot['target_id_type'], slot['name_display'])
+            bucket = available.get((slot['target_id_type'], slot['name_display']))
+            new_slot = bucket.pop() if bucket else datablock.slots.new(
+                slot['target_id_type'], slot['name_display'])
 
             if bpy.app.version >= (5,0,0):
                 channelbag = anim_utils.action_ensure_channelbag_for_slot(datablock, new_slot)
@@ -399,10 +410,28 @@ class BlAction(ReplicatedDatablock):
                     )
                     if fcurve is None:
                         fcurve = channelbag.fcurves.new(
-                            dumped_data_path, 
+                            dumped_data_path,
                             index=dumped_array_index,
                         )
                     load_fcurve(dumped_fcurve, fcurve)
+
+                # The dump is the whole truth for this slot, so drop curves it
+                # does not carry. load_fcurve only clears the points of curves
+                # that appear in the dump, and reusing the slot instead of
+                # tearing it down means a curve the pose overlay had to invent -
+                # location and scale when the Host only keyed rotation - would
+                # survive the reload. invalidate_overlays then drops the overlay
+                # bookkeeping without restoring, orphaning that temporary
+                # keyframe in the viewer's action, which reads exactly as a
+                # keyframe the viewer had confirmed.
+                dumped_keys = {
+                    (fc["data_path"], fc["dumped_array_index"])
+                    for fc in slot["fcurves"]
+                }
+                for stale_curve in list(channelbag.fcurves):
+                    if (stale_curve.data_path,
+                            stale_curve.array_index) not in dumped_keys:
+                        channelbag.fcurves.remove(stale_curve)
             else:
                 for dumped_fcurve in data["fcurves"]:
                     dumped_data_path = dumped_fcurve["data_path"]
@@ -416,6 +445,15 @@ class BlAction(ReplicatedDatablock):
                             dumped_data_path, index=dumped_array_index)
 
                     load_fcurve(dumped_fcurve, fcurve)
+
+        # Drop only the slots the incoming data no longer carries. Skipped when
+        # the payload holds no slot information at all - a pre-5.0 dump keeps
+        # its curves at the top level - so such a payload cannot wipe the
+        # action's slots as a side effect.
+        if incoming_slots:
+            for bucket in available.values():
+                for stale in bucket:
+                    datablock.slots.remove(stale)
 
         keys_after = count_action_keyframes(datablock)
         if keys_after < keys_before:

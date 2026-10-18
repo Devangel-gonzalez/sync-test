@@ -20,7 +20,7 @@ import sys
 import traceback
 import bpy
 from replication.constants import (FETCHED, RP_COMMON, STATE_ACTIVE,
-                                   STATE_LOBBY)
+                                   STATE_LOBBY, UP)
 from replication.exception import NonAuthorizedOperationError
 from replication.interface import session
 from replication import porcelain
@@ -141,12 +141,31 @@ class LiveSyncTimer(Timer):
 
 
 class ApplyTimer(Timer):
+    def __init__(self, timeout=10):
+        super().__init__(timeout)
+        # node uuid -> the exact data object last applied. Holding the reference
+        # keeps it alive so an identity test is exact and cannot be fooled by a
+        # recycled id. do_commit always replaces node.data with a new object
+        # (patch does `self.data = self.data + delta`), so "same object" means
+        # genuinely no new data arrived.
+        self._applied_data = {}
+
     def execute(self):
         if session and session.state == STATE_ACTIVE:
             for node in session.repository.graph.keys():
                 node_ref = session.repository.graph.get(node)
 
                 if node_ref.state == FETCHED:
+                    if self._applied_data.get(node) is node_ref.data:
+                        # Back to FETCHED with data we already applied. A real
+                        # session showed this looping about six times a second
+                        # on one Action with no commit anywhere on the Host:
+                        # each pass tore the Action's slots down and rebuilt
+                        # them, so the armature had no evaluable animation in
+                        # between and the bone froze. Settle the node instead of
+                        # reloading identical data.
+                        node_ref.state = UP
+                        continue
                     try:
                         shared_data.session.applied_updates.append(node)
                         porcelain.apply(session.repository, node)
@@ -165,6 +184,10 @@ class ApplyTimer(Timer):
                         logging.error(
                             f"Fail to apply {node_ref.uuid}: {e!r}", exc_info=True)
                     else:
+                        # Remember exactly which object was applied, so a node
+                        # that returns to FETCHED carrying the same object is
+                        # recognised as having nothing new.
+                        self._applied_data[node] = node_ref.data
                         impl = session.repository.rdp.get_implementation(node_ref.instance)
                         reloaded_action = is_action_node(node_ref)
                         if impl.bl_reload_parent:
