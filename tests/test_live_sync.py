@@ -1114,8 +1114,12 @@ def test_can_publish_common_nodes(multi_user):
     foreign = _FakeNode("foreign", "Action", "someone-else")
 
     check(
-        handlers.can_publish(owned, username, False, False),
-        "a node owned by this peer is publishable",
+        handlers.can_publish(owned, username, False, True),
+        "the Host may publish a node it owns",
+    )
+    check(
+        not handlers.can_publish(owned, "Cliente", False, False),
+        "a viewer may not publish, not even a node it owns",
     )
     check(
         handlers.can_publish(common_action, username, False, True),
@@ -1129,9 +1133,16 @@ def test_can_publish_common_nodes(multi_user):
         not handlers.can_publish(foreign, username, False, True),
         "another peer's node is not publishable, not even by the Host",
     )
+    # The bl_check_common types (Collection, Scene, World) are the leak that
+    # mattered: they passed for any peer, so a viewer committed and pushed
+    # Collections, the Host applied them and tore objects down.
     check(
-        handlers.can_publish(foreign, username, True, False),
-        "bl_check_common types stay publishable as before",
+        handlers.can_publish(foreign, username, True, True),
+        "bl_check_common types are publishable by the Host",
+    )
+    check(
+        not handlers.can_publish(foreign, "Cliente", True, False),
+        "bl_check_common types are not publishable by a viewer",
     )
     check(
         not handlers.can_publish(None, username, True, True),
@@ -1214,6 +1225,191 @@ def test_multi_turn_rotation_is_preserved(bpy, live_sync):
     applier.cleanup()
 
 
+def test_action_delta_chain_roundtrip(bpy, multi_user):
+    """Successive commits must reconstruct the Action on the receiving peer.
+
+    porcelain sends a deepdiff Delta for Actions (BlAction.use_delta = True) and
+    the receiving Node applies it with `self.data = self.data + commit.delta`.
+    A real Host log showed the Action entering the batch thousands of times in
+    state UP and armed, yet `committed Action` fired only once in the whole
+    session, and the viewer's keyframes lagged one edit behind - which is what
+    a delta chain that does not round-trip looks like.
+    """
+    section("Action delta chain round-trip")
+
+    from multi_user.bl_types import bl_action
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+    fcurve = action_fcurves(bpy, action, armature).find(
+        'pose.bones["Bone"].location', index=0)
+    check(fcurve is not None, "test scene exposes a location curve")
+    if fcurve is None:
+        return
+
+    # Both peers start from a fresh dump. The sender's copy models node.data,
+    # which porcelain carries forward and patches - it is NOT re-dumped each
+    # time, so a patch that corrupts or aliases it makes every later delta
+    # wrong. That is the "first K works, second does not" failure mode.
+    sender_data = bl_action.BlAction.dump(action)
+    receiver = bl_action.BlAction.dump(action)
+
+    for frame, value in ((75.0, 3.0), (90.0, -2.0)):
+        # This is what pressing K and choosing Location does.
+        fcurve.keyframe_points.insert(frame, value, options={'FAST'})
+        fcurve.update()
+
+        new_version = bl_action.BlAction.dump(action)
+        delta = bl_action.BlAction.compute_delta(sender_data, new_version)
+        check(
+            bool(delta.diff),
+            f"inserting a keyframe at frame {int(frame)} produces a delta",
+        )
+
+        # porcelain: node.patch(commit) on the sender, do_commit on the viewer.
+        sender_data = sender_data + delta
+        receiver = receiver + delta
+
+        fresh = bl_action.BlAction.dump(action)
+        # repr rather than compute_delta: comparing through deepdiff would be
+        # circular, since a deepdiff that cannot see the change reports the
+        # patched data as already correct.
+        check(
+            repr(sender_data) == repr(fresh),
+            f"sender node.data matches a fresh dump after the patch at {int(frame)}",
+        )
+        check(
+            repr(receiver) == repr(fresh),
+            f"receiver matches a fresh dump after the insert at {int(frame)}",
+        )
+
+
+def test_invalidate_overlays_does_not_restore(bpy, live_sync):
+    """Dropping an overlay after an Action reload must not restore anything.
+
+    BlAction.load rebuilds every slot, so the fcurve wrappers and backed-up
+    values the overlay holds are dead by then. cleanup() restores them, which
+    would write stale values over the data that was just applied - the reported
+    "the keyframe the Host confirmed disappears on the viewer".
+    invalidate_overlays() has to drop the bookkeeping and leave the freshly
+    applied curves alone.
+    """
+    section("Invalidate overlays without restoring")
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+    applier = live_sync.ClientPoseApplier()
+
+    applier.apply({
+        "channel": "live_sync", "action": "start",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
+    })
+    applier.apply({
+        "channel": "live_sync", "action": "update",
+        "armature_uuid": "test-armature-uuid", "bone_name": "Bone", "frame": 30,
+        "matrix_basis": [[1, 0, 0, 4.0], [0, 1, 0, 5.0],
+                         [0, 0, 1, 6.0], [0, 0, 0, 1]],
+        "location": (4.0, 5.0, 6.0),
+        "rotation_mode": "XYZ",
+        "rotation": (0.0, 0.0, 0.0),
+        "scale": (1.0, 1.0, 1.0),
+    })
+
+    def location_at(frame):
+        fcurve = action_fcurves(bpy, action, armature).find(
+            'pose.bones["Bone"].location', index=0)
+        if fcurve is None:
+            return None
+        for point in fcurve.keyframe_points:
+            if abs(point.co.x - frame) < 0.5:
+                return point.co.y
+        return None
+
+    written = location_at(30)
+    check(
+        written is not None and abs(written - 4.0) < 1e-4,
+        "the overlay wrote its temporary keyframe",
+    )
+
+    applier.invalidate_overlays("test Action reload")
+
+    check(not applier._edits, "invalidate drops the overlay bookkeeping")
+    check(
+        applier.state == live_sync.IDLE,
+        "invalidate returns the applier to idle",
+    )
+    still = location_at(30)
+    check(
+        still is not None and abs(still - 4.0) < 1e-4,
+        "invalidate leaves the applied curves untouched instead of restoring",
+    )
+
+
+def test_action_delta_roundtrip_move_and_delete(bpy, multi_user):
+    """Moving and deleting a keyframe must also survive the delta round-trip.
+
+    Inserting was already covered, and in a real session inserts mostly worked
+    while dragging a keyframe in the Dope Sheet broke sync permanently - only
+    re-pressing the Live Sync toggle recovered it, and that toggle pushes with
+    force=True, i.e. the whole node instead of a delta. That is the signature of
+    the receiver's node.data diverging from the sender's: from then on every
+    delta is applied to the wrong base. A non-empty delta is not enough, it has
+    to reconstruct the new dump exactly.
+    """
+    section("Action delta round-trip: move and delete")
+
+    from multi_user.bl_types import bl_action
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+    fcurve = action_fcurves(bpy, action, armature).find(
+        'pose.bones["Bone"].location', index=0)
+    check(fcurve is not None, "test scene exposes a location curve")
+    if fcurve is None:
+        return
+
+    sender_data = bl_action.BlAction.dump(action)
+    receiver = bl_action.BlAction.dump(action)
+
+    def roundtrip(label):
+        """Advance both peers through one delta and compare against reality."""
+        nonlocal sender_data, receiver
+        new_version = bl_action.BlAction.dump(action)
+        delta = bl_action.BlAction.compute_delta(sender_data, new_version)
+        check(bool(delta.diff), f"{label}: produces a non-empty delta")
+
+        sender_data = sender_data + delta
+        receiver = receiver + delta
+
+        # repr rather than compute_delta: comparing through deepdiff would be
+        # circular, since a deepdiff blind to the change reports the patched
+        # data as already correct.
+        fresh = bl_action.BlAction.dump(action)
+        check(
+            repr(sender_data) == repr(fresh),
+            f"{label}: sender node.data matches a fresh dump after patch",
+        )
+        check(
+            repr(receiver) == repr(fresh),
+            f"{label}: receiver matches a fresh dump after patch",
+        )
+
+    # Move an existing keyframe, the way dragging it in the Dope Sheet does.
+    point = fcurve.keyframe_points[0]
+    original_x = float(point.co.x)
+    point.co.x = original_x + 12.0
+    point.handle_left.x = float(point.handle_left.x) + 12.0
+    point.handle_right.x = float(point.handle_right.x) + 12.0
+    fcurve.update()
+    roundtrip("move a keyframe")
+
+    # Delete one, which changes the array length rather than a value.
+    victim = fcurve.keyframe_points[len(fcurve.keyframe_points) - 1]
+    fcurve.keyframe_points.remove(victim)
+    fcurve.update()
+    roundtrip("delete a keyframe")
+
+
 def ensure_addon_entry(bpy, module_name):
     """Make the package look like an enabled addon to preferences.
 
@@ -1267,8 +1463,11 @@ def main():
         test_failed_apply_leaves_no_stale_marker(multi_user)
         test_animation_dependency_push(multi_user)
         test_action_delta_detects_moved_keyframe(bpy, multi_user)
+        test_action_delta_chain_roundtrip(bpy, multi_user)
+        test_action_delta_roundtrip_move_and_delete(bpy, multi_user)
         test_can_publish_common_nodes(multi_user)
         test_multi_turn_rotation_is_preserved(bpy, live_sync)
+        test_invalidate_overlays_does_not_restore(bpy, live_sync)
     except Exception:
         traceback.print_exc()
         _failures.append("unhandled exception (see traceback above)")

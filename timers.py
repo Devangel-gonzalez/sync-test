@@ -45,6 +45,17 @@ def is_annotating(context: bpy.types.Context):
     return (active_tool and active_tool.idname == 'builtin.annotate')
 
 
+def is_action_node(node_ref) -> bool:
+    """True when a replication graph node holds an Action.
+
+    Reloading an Action rebuilds all of its slots, which invalidates any live
+    pose overlay the viewer is holding against those curves.
+    """
+    if node_ref is None:
+        return False
+    return (getattr(node_ref, 'data', None) or {}).get('type_id') == 'Action'
+
+
 class Timer(object):
     """Timer binder interface for blender
 
@@ -155,6 +166,7 @@ class ApplyTimer(Timer):
                             f"Fail to apply {node_ref.uuid}: {e!r}", exc_info=True)
                     else:
                         impl = session.repository.rdp.get_implementation(node_ref.instance)
+                        reloaded_action = is_action_node(node_ref)
                         if impl.bl_reload_parent:
                             for parent in session.repository.graph.get_parents(node):
                                 logging.debug("Refresh parent {node}")
@@ -168,6 +180,19 @@ class ApplyTimer(Timer):
                                 porcelain.apply(session.repository,
                                                 dep,
                                                 force=True)
+                                if is_action_node(
+                                        session.repository.graph.get(dep)):
+                                    reloaded_action = True
+                        if reloaded_action:
+                            # BlAction.load removed and rebuilt every slot, so
+                            # any live pose overlay is holding dead fcurve
+                            # wrappers and stale backed-up values. Letting it
+                            # restore would overwrite the data just applied,
+                            # which is how a keyframe the Host had confirmed
+                            # disappeared on the viewer. The Host re-sends the
+                            # pose within one heartbeat, so nothing is lost.
+                            live_sync.invalidate_overlays(
+                                f"Action reloaded by the apply of {node}")
 
 
 class AnnotationUpdates(Timer):

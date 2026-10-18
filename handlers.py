@@ -143,9 +143,20 @@ def can_publish(node, username: str, check_common: bool, host_peer: bool) -> boo
     """
     if node is None:
         return False
+    # The Client is a passive receiver (README 1.4) with no commit/push
+    # capability at all, and that cannot be delegated to ownership:
+    # porcelain.assert_modification_rights accepts RP_COMMON for any peer, and
+    # the bl_check_common types (Collection, Scene, World) pass for anyone too.
+    # A viewer was therefore committing and pushing Collections, the Host
+    # applied them, objects got torn down and rebuilt - flooding the Host log
+    # with "StructRNA of type Object has been removed" and breaking the
+    # armature's link to its Action, which is how every keyframe on the viewer
+    # vanished until a forced full-node push resynced it.
+    if not host_peer:
+        return False
     if node.owner == username or check_common:
         return True
-    return host_peer and node.owner == RP_COMMON
+    return node.owner == RP_COMMON
 
 
 @persistent
@@ -253,14 +264,6 @@ def on_scene_update(scene):
                     # is still enforced above: live sync does not grant rights.
                     is_live = shared_data.session.live_sync_nodes.get(node.uuid, False)
 
-                    if (node.data or {}).get('type_id') == 'Action':
-                        # Actions change rarely, so this stays quiet. It is the
-                        # line that says whether a keyframe edit reached the
-                        # commit path at all, and in which state.
-                        logging.info(
-                            f"Live Sync: Action {node.uuid} in batch, "
-                            f"state={node.state}, armed={is_live}")
-
                     # README 7.8: no porcelain during an interactive transform.
                     # The pose streamer carries the in-progress edit over the
                     # direct channel; confirming it produces its own depsgraph
@@ -275,7 +278,21 @@ def on_scene_update(scene):
 
                     if is_live or node.state == UP:
                         try:
+                            state_before = node.state
                             porcelain.commit(session.repository, node.uuid)
+                            if node.state != state_before:
+                                # commit only moves the state when it found a
+                                # real diff, so this is one line per genuine
+                                # edit and none while idle. A keyframe inserted
+                                # with K that never reaches the viewer shows up
+                                # here as the absence of a line, which is what
+                                # separates "never committed" from "committed
+                                # but lost on the way".
+                                logging.info(
+                                    f"Live Sync: committed "
+                                    f"{(node.data or {}).get('type_id')} "
+                                    f"{node.uuid} "
+                                    f"(state {state_before} -> {node.state})")
                             porcelain.push(session.repository,
                                            'origin', node.uuid)
                             if is_live:

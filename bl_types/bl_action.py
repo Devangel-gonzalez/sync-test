@@ -313,6 +313,28 @@ def count_action_curves(action):
     return len(action.fcurves)
 
 
+def count_action_keyframes(action):
+    """Total number of keyframe points an action currently holds.
+
+    Used to detect a reload that silently loses data: counting curves alone is
+    not enough, because a partial payload can rebuild every curve while
+    carrying fewer points than the action already had.
+    """
+    if bpy.app.version >= (5, 0, 0):
+        total = 0
+        for slot in action.slots:
+            channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
+            if channelbag is None:
+                continue
+            for fcurve in channelbag.fcurves:
+                total += len(fcurve.keyframe_points)
+        return total
+    total = 0
+    for fcurve in action.fcurves:
+        total += len(fcurve.keyframe_points)
+    return total
+
+
 class BlAction(ReplicatedDatablock):
     use_delta = True
 
@@ -347,6 +369,12 @@ class BlAction(ReplicatedDatablock):
                     f"0 curves but already holds {local_curves}; keeping the "
                     f"existing keyframes instead of wiping them")
                 return
+
+        # Counted so a reload that silently loses data says so. The guard above
+        # only catches a payload carrying no curves at all; a partial one still
+        # wipes whatever it does not carry, and the viewer then sees every
+        # keyframe vanish.
+        keys_before = count_action_keyframes(datablock)
 
         # Load slots
         # Snapshot before removing: mutating a bpy_prop_collection while it is
@@ -388,6 +416,13 @@ class BlAction(ReplicatedDatablock):
                             dumped_data_path, index=dumped_array_index)
 
                     load_fcurve(dumped_fcurve, fcurve)
+
+        keys_after = count_action_keyframes(datablock)
+        if keys_after < keys_before:
+            logging.warning(
+                f"Action '{getattr(datablock, 'name', datablock)}' lost "
+                f"keyframes on reload: {keys_before} -> {keys_after} "
+                f"(payload carried {incoming_curves} curve(s))")
 
         id_root = data.get('id_root')
 

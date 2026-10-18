@@ -1300,6 +1300,30 @@ class ClientPoseApplier:
         self._armature_cache.clear()
         self.state = IDLE
 
+    def invalidate_overlays(self, reason: str):
+        """Drop every overlay WITHOUT restoring it.
+
+        BlAction.load removes all of an Action's slots and rebuilds them, so the
+        moment an apply lands, every fcurve wrapper and backed-up value an
+        overlay holds is dead. Restoring afterwards writes stale values into the
+        freshly applied curves: that is how a keyframe the Host had just
+        confirmed vanished on the viewer, and how the bone could lose all of
+        them. cleanup() is wrong here precisely because it restores.
+
+        Nothing is lost by dropping: the Host re-sends the pose within one
+        heartbeat, so the overlay is rebuilt from live data in a fraction of a
+        second.
+        """
+        if not self._edits:
+            return
+        logging.info(
+            f"Live Sync: dropping {len(self._edits)} overlay(s) without "
+            f"restoring them: {reason}")
+        self._edits.clear()
+        self._armature_cache.clear()
+        self._ended.clear()
+        self.state = IDLE
+
     # -- helpers ---------------------------------------------------------- #
 
     @staticmethod
@@ -1520,6 +1544,16 @@ def pose_stream_active():
     still running and suppress porcelain pushes indefinitely.
     """
     return engine.streamer.transform_active
+
+
+def invalidate_overlays(reason: str):
+    """Drop the viewer's temporary keyframes without restoring them.
+
+    Called by timers.ApplyTimer after an Action is reloaded: the reload rebuilds
+    every slot, so the overlay's fcurve wrappers and backed-up values are dead
+    and restoring them would overwrite the data that was just applied.
+    """
+    engine.applier.invalidate_overlays(reason)
 
 
 def shutdown():
