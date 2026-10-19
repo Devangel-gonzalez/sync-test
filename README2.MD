@@ -768,10 +768,10 @@ por nombre, objetos solo por uuid.
 `collection.get(name)`, y `BlObject.resolve` le pasa `data.get("name")`. Los nombres
 son únicos por colección en Blender, así que el respaldo no es ambiguo.
 
-**Confirmado por el usuario:** hospedar → guardar → copiar evita los renames por
-completo, lo que fija la causa en los uuid ausentes. Con el respaldo, el flujo
-guardar → copiar → hospedar también funciona, así que el addon ya no impone un orden
-de preparación.
+**Confirmado por el usuario (2026-10-19):** ambos flujos funcionan. Hospedar →
+guardar → copiar ya evitaba los renames antes del cambio, lo que fijó la causa en los
+uuid ausentes; y con el respaldo por nombre, guardar → copiar → hospedar también
+funciona. El addon ya no impone un orden de preparación del archivo.
 
 **Alcance:** solo `BlObject.resolve` pasa el nombre; los otros ~23 `resolve` de
 `bl_types` quedaron igual. **Sin test:** el harness no simula un viewer sin uuid.
@@ -818,25 +818,21 @@ el llamador lo pase a `is_action_node`, que ya tolera `None`.
    `resolve` de `bl_types` (mesh, material, armature, action, camera, light,
    collection, scene, world, ...) siguen emparejando solo por uuid. Si otro tipo
    muestra el síntoma de 6.19, se aplica el mismo patrón de una línea.
-4. **Pendiente de confirmar por el usuario:** que el flujo hospedar → guardar →
-   copiar siga funcionando después del respaldo por nombre. Antes del cambio era el
-   único que funcionaba; con el cambio, `resolve` encuentra el objeto por uuid y ni
-   siquiera llega al respaldo, así que debería ser neutro.
-5. **`lost keyframes on reload`** cuenta los keyframes del overlay como reales, así
+4. **`lost keyframes on reload`** cuenta los keyframes del overlay como reales, así
    que dispara en cada apply mientras haya overlay activo. Debería comparar contra el
    conteo de keyframes **del payload**.
-6. **`presence.py`** lanza `Post view widget exception: StructRNA of type Object has
+5. **`presence.py`** lanza `Post view widget exception: StructRNA of type Object has
    been removed` cuando un widget sostiene referencias a objetos ya destruidos.
    Debería validarlas por sí solo. Con 6.19 arreglado los objetos ya no se destruyen
    al conectar, así que debería aparecer mucho menos, pero la validación sigue
    faltando.
-7. **La rama 4.x de `BlAction.load`** no tiene podado de curvas y arrastra el quirk
+6. **La rama 4.x de `BlAction.load`** no tiene podado de curvas y arrastra el quirk
    de iterar `data["fcurves"]` una vez por slot. **Aceptado y sin prioridad**: la
    versión objetivo es 5.2.2 (ver 5.5). Solo tocarla si aparece un requerimiento real
    de 4.x, y nunca a costa de complicar la rama de Blender 5.
-8. **Rotación con `rotation_mode` distinto entre peers** pierde el conteo de vueltas
+7. **Rotación con `rotation_mode` distinto entre peers** pierde el conteo de vueltas
    (la conversión pasa por quaternion). Sin impacto mientras ambos usen el mismo modo.
-9. **Reconstrucción inicial cuando los datos ya coinciden — PRIORIDAD MÍNIMA.** Al
+8. **Reconstrucción inicial cuando los datos ya coinciden — PRIORIDAD MÍNIMA.** Al
    conectar, el snapshot marca todos los nodos como FETCHED (`repository.loads()`) y
    `ApplyTimer` los aplica sin comprobar si los datos locales ya coinciden. Con un
    .blend copiado eso reconstruye el archivo entero sin necesidad y expone cada camino
@@ -846,8 +842,8 @@ el llamador lo pase a `is_action_node`, que ya tolera `None`.
    convergencia para peers que sí divergieron y exigiría una comparación fiable de
    datos que contienen numpy. Decisión del usuario, 2026-10-19: dejarlo como la
    prioridad más baja posible.
-10. **Riesgo residual del respaldo por nombre:** si un viewer abre un archivo
-    *distinto* que casualmente tiene un objeto homónimo, se emparejarían mal. Se
-    aceptó porque el comportamiento anterior en ese caso era estrictamente peor
-    (duplicar, eliminar el original y colgar todos los punteros), pero conviene
-    recordarlo si aparece sincronización cruzada entre objetos no relacionados.
+9. **Riesgo residual del respaldo por nombre:** si un viewer abre un archivo
+   *distinto* que casualmente tiene un objeto homónimo, se emparejarían mal. Se
+   aceptó porque el comportamiento anterior en ese caso era estrictamente peor
+   (duplicar, eliminar el original y colgar todos los punteros), pero conviene
+   recordarlo si aparece sincronización cruzada entre objetos no relacionados.
