@@ -732,34 +732,122 @@ uno Boolean para probar que la resolución es genérica y no un caso especial.
 Asumir que el `Dumper` guardaba un uuid o una referencia habría producido un arreglo
 que no resolvía nada.
 
+### 6.19 El viewer perdía sus objetos: se reemplazaban en vez de actualizarse
+
+**Síntoma:** al conectarse el cliente, todos sus objetos aparecían con un sufijo +1
+(`Camera` → `Camera.001`, `Light` → `Light.001`, `Cube.001` → `Cube.002`,
+`Esqueleto.001` → `Esqueleto.002`), el cubo dejaba de seguir al hueso, y su
+modificador Armature mostraba `Esqueleto.001` **con un 0 al lado** — la marca de
+Blender para una referencia colgante.
+
+**Causa:** `resolve_datablock_from_uuid` emparejaba **solo por uuid**; no crea nada y
+no tenía respaldo por nombre. El flujo de prueba era preparar `test.blend`, guardarlo,
+copiarlo y recién entonces hospedar — y como `porcelain.add` stampea los uuid al
+crear la sesión, **la copia no tenía uuid**. Entonces `resolve` no encontraba nada, el
+apply **creaba** un objeto nuevo con el nombre del dump, Blender le asignaba el sufijo
+siguiente porque el nombre estaba ocupado, y el original quedaba sin usuarios y se
+descartaba. Todo puntero al original quedaba colgando.
+
+La traza de entrada de `BlObject.load` lo mostró directo:
+
+```
+BlObject.load on 'Esqueleto.002' (uuid 687679c4..., dump name 'Esqueleto.001',
+                                  dump uuid 687679c4...)
+```
+
+uuid local idéntico al del dump, nombre bumped. Y ningún `apply renamed`, porque
+`loader.load()` **no escribe `name`**: el objeto ya nacía con el nombre bumped, no se
+renombraba después.
+
+**Por qué la malla conservaba su nombre:** `BlObject.load` ya resolvía los *datos* del
+objeto con respaldo por nombre — `get_datablock_from_uuid(data_uuid,
+find_data_from_name(data_id), ignore=["images"])`. La asimetría **era** el bug: datos
+por nombre, objetos solo por uuid.
+
+**Arreglo:** `resolve_datablock_from_uuid(uuid, collection, name=None)` con respaldo
+`collection.get(name)`, y `BlObject.resolve` le pasa `data.get("name")`. Los nombres
+son únicos por colección en Blender, así que el respaldo no es ambiguo.
+
+**Confirmado por el usuario:** hospedar → guardar → copiar evita los renames por
+completo, lo que fija la causa en los uuid ausentes. Con el respaldo, el flujo
+guardar → copiar → hospedar también funciona, así que el addon ya no impone un orden
+de preparación.
+
+**Alcance:** solo `BlObject.resolve` pasa el nombre; los otros ~23 `resolve` de
+`bl_types` quedaron igual. **Sin test:** el harness no simula un viewer sin uuid.
+
+> **Lección de método:** tres diagnósticos (rename, `NAME fallback`, parent sin
+> resolver) no dispararon, y su **ausencia conjunta** fue más informativa que
+> cualquier línea presente: permitió descartar la carga y apuntar a la creación. Pero
+> hizo falta una traza en la **entrada** de `BlObject.load` para verlo. Instrumentar
+> solo la salida deja invisible el camino de creación.
+
+### 6.20 Tormenta de re-apply sobre el mismo objeto
+
+**Síntoma:** `BlObject.load` corría decenas de veces por segundo sobre el mismo
+objeto — líneas 141, 143, 144, 147, 148, 149... todas dentro del mismo segundo.
+
+**Causa:** las ramas `bl_reload_parent` y `bl_reload_child` de `ApplyTimer` llaman a
+`porcelain.apply(..., force=True)`, que bypasea **a propósito** el chequeo de estado
+`FETCHED` en el que se apoyaba la guarda de identidad de 6.16. Cada pasada corre
+`load_modifiers`, que hace `modifiers.clear()`: el stack de modificadores se destruía
+y reconstruía decenas de veces por segundo.
+
+**Arreglo:** `_force_apply(uuid)` centraliza la guarda — salta si el nodo trae el
+mismo objeto `data` ya aplicado, si no aplica y lo registra. Devuelve el nodo para que
+el llamador lo pase a `is_action_node`, que ya tolera `None`.
+
+> **Lección:** una guarda puesta en un solo punto de entrada no cubre los caminos que
+> la bypasean a propósito. `force=True` existe justamente para saltear el chequeo de
+> estado, así que cualquier protección basada en ese estado necesita su propio
+> equivalente en el camino forzado.
+
 ## 7. Cabos sueltos conocidos
 
 1. **Qué re-marca un nodo como FETCHED** sin que el Host commitee. Un log real
    mostró el mismo Action re-aplicado ~6 veces por segundo con cero commits en el
-   Host. La guarda de identidad en `ApplyTimer` lo neutraliza, pero la causa raíz
-   sigue sin identificarse y podría aparecer en otro tipo de nodo.
-2. **Tres caminos sin test dedicado:** recargar un Action dos veces con un overlay en
-   vuelo, la guarda de identidad FETCHED, y el podado de curvas. Es la deuda más
-   concreta: pueden regresionar en silencio.
-3. **`lost keyframes on reload`** cuenta los keyframes del overlay como reales, así
+   Host. Las dos guardas de identidad (la de `FETCHED` en 6.16 y `_force_apply` en
+   6.20) neutralizan los dos caminos de re-apply conocidos, pero **la causa raíz
+   sigue sin identificarse** y podría aparecer por un tercero.
+2. **Caminos sin test dedicado:** la guarda de identidad FETCHED, `_force_apply`, y
+   el respaldo por nombre en `resolve`. El de la recarga del Action ya está cubierto
+   por `test_action_reload_reuses_slots_and_prunes`. Es la deuda más concreta: pueden
+   regresionar en silencio. El respaldo por nombre es el más difícil de testear,
+   porque exige simular un viewer cuyos datablocks no tienen uuid.
+3. **El respaldo por nombre solo está en `BlObject.resolve`.** Los otros ~23
+   `resolve` de `bl_types` (mesh, material, armature, action, camera, light,
+   collection, scene, world, ...) siguen emparejando solo por uuid. Si otro tipo
+   muestra el síntoma de 6.19, se aplica el mismo patrón de una línea.
+4. **Pendiente de confirmar por el usuario:** que el flujo hospedar → guardar →
+   copiar siga funcionando después del respaldo por nombre. Antes del cambio era el
+   único que funcionaba; con el cambio, `resolve` encuentra el objeto por uuid y ni
+   siquiera llega al respaldo, así que debería ser neutro.
+5. **`lost keyframes on reload`** cuenta los keyframes del overlay como reales, así
    que dispara en cada apply mientras haya overlay activo. Debería comparar contra el
    conteo de keyframes **del payload**.
-4. **`presence.py`** lanza `Post view widget exception: StructRNA of type Object has
+6. **`presence.py`** lanza `Post view widget exception: StructRNA of type Object has
    been removed` cuando un widget sostiene referencias a objetos ya destruidos.
-   Debería validarlas por sí solo.
-5. **La rama 4.x de `BlAction.load`** no tiene podado de curvas y arrastra el quirk
+   Debería validarlas por sí solo. Con 6.19 arreglado los objetos ya no se destruyen
+   al conectar, así que debería aparecer mucho menos, pero la validación sigue
+   faltando.
+7. **La rama 4.x de `BlAction.load`** no tiene podado de curvas y arrastra el quirk
    de iterar `data["fcurves"]` una vez por slot. **Aceptado y sin prioridad**: la
    versión objetivo es 5.2.2 (ver 5.5). Solo tocarla si aparece un requerimiento real
    de 4.x, y nunca a costa de complicar la rama de Blender 5.
-6. **Rotación con `rotation_mode` distinto entre peers** pierde el conteo de vueltas
+8. **Rotación con `rotation_mode` distinto entre peers** pierde el conteo de vueltas
    (la conversión pasa por quaternion). Sin impacto mientras ambos usen el mismo modo.
-7. **Reconstrucción inicial cuando los datos ya coinciden — PRIORIDAD MÍNIMA.** Al
+9. **Reconstrucción inicial cuando los datos ya coinciden — PRIORIDAD MÍNIMA.** Al
    conectar, el snapshot marca todos los nodos como FETCHED (`repository.loads()`) y
    `ApplyTimer` los aplica sin comprobar si los datos locales ya coinciden. Con un
    .blend copiado eso reconstruye el archivo entero sin necesidad y expone cada camino
-   con pérdidas de todos los loaders en el momento menos útil. La guarda de identidad
-   de `ApplyTimer` cubre las aplicaciones **repetidas** del mismo objeto de datos, no
-   la inicial, donde el objeto es nuevo por definición. Evitarlo cambiaría la
-   semántica de convergencia para peers que sí divergieron y exigiría una comparación
-   fiable de datos que contienen numpy. Decisión del usuario, 2026-10-19: dejarlo como
-   la prioridad más baja posible.
+   con pérdidas de todos los loaders en el momento menos útil. Las guardas de identidad
+   cubren las aplicaciones **repetidas** del mismo objeto de datos, no la inicial,
+   donde el objeto es nuevo por definición. Evitarlo cambiaría la semántica de
+   convergencia para peers que sí divergieron y exigiría una comparación fiable de
+   datos que contienen numpy. Decisión del usuario, 2026-10-19: dejarlo como la
+   prioridad más baja posible.
+10. **Riesgo residual del respaldo por nombre:** si un viewer abre un archivo
+    *distinto* que casualmente tiene un objeto homónimo, se emparejarían mal. Se
+    aceptó porque el comportamiento anterior en ese caso era estrictamente peor
+    (duplicar, eliminar el original y colgar todos los punteros), pero conviene
+    recordarlo si aparece sincronización cruzada entre objetos no relacionados.
