@@ -651,6 +651,19 @@ class BlObject(ReplicatedDatablock):
     @staticmethod
     def load(data: dict, datablock: object):
         loader = Loader()
+        # Entry trace. Three diagnostics downstream stayed silent for a viewer
+        # whose cube and armature were both being renamed on connect, which
+        # only makes sense if this method never ran for them: the rename and the
+        # stale modifier target then come from a different path, most likely
+        # object creation when resolve() cannot match the local datablock by
+        # uuid. Logging the entry separates "load did not run" from "load ran
+        # and something inside it renamed the object".
+        logging.info(
+            f"Live Sync: BlObject.load on '{datablock.name}' "
+            f"(uuid {getattr(datablock, 'uuid', None)!r}, "
+            f"dump name {data.get('name')!r}, "
+            f"dump uuid {data.get('uuid')!r})")
+
         load_animation_data(data.get('animation_data'), datablock)
         data_uuid = data.get("data_uuid")
         data_id = data.get("data")
