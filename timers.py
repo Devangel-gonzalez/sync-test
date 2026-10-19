@@ -150,6 +150,27 @@ class ApplyTimer(Timer):
         # genuinely no new data arrived.
         self._applied_data = {}
 
+    def _force_apply(self, uuid):
+        """Apply a parent or dependency unless that exact data was already loaded.
+
+        These calls pass force=True, which deliberately bypasses the FETCHED
+        state check the main guard relies on, so they need a guard of their own.
+        Without it the same node is rebuilt on every pass: a real session logged
+        BlObject.load running dozens of times a second on one object, and each
+        pass clears and rebuilds its modifiers through load_modifiers.
+
+        Returns the graph node, or None when the uuid is not in the graph, so a
+        caller can feed the result straight to is_action_node.
+        """
+        node_ref = session.repository.graph.get(uuid)
+        if node_ref is None:
+            return None
+        if self._applied_data.get(uuid) is node_ref.data:
+            return node_ref
+        porcelain.apply(session.repository, uuid, force=True)
+        self._applied_data[uuid] = node_ref.data
+        return node_ref
+
     def execute(self):
         if session and session.state == STATE_ACTIVE:
             for node in session.repository.graph.keys():
@@ -193,18 +214,10 @@ class ApplyTimer(Timer):
                         if impl.bl_reload_parent:
                             for parent in session.repository.graph.get_parents(node):
                                 logging.debug("Refresh parent {node}")
-                                porcelain.apply(
-                                    session.repository,
-                                    parent.uuid,
-                                    force=True
-                                )
+                                self._force_apply(parent.uuid)
                         if hasattr(impl, 'bl_reload_child') and impl.bl_reload_child:
                             for dep in node_ref.dependencies:
-                                porcelain.apply(session.repository,
-                                                dep,
-                                                force=True)
-                                if is_action_node(
-                                        session.repository.graph.get(dep)):
+                                if is_action_node(self._force_apply(dep)):
                                     reloaded_action = True
                         if reloaded_action:
                             # BlAction.load removed and rebuilt every slot, so
