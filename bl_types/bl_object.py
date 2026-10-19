@@ -679,12 +679,24 @@ class BlObject(ReplicatedDatablock):
         #  Parenting
         parent_id = data.get("parent_uid")
         if parent_id:
+            # .get(), not a subscript. This is the *fallback* argument, but
+            # Python evaluates it before get_datablock_from_uuid runs, so
+            # subscripting by name raised KeyError whenever the parent had a
+            # different name locally - which is the normal case, since applying
+            # the snapshot can rename a datablock to avoid a collision. The
+            # uuid in parent_id[0] resolves fine on its own; the name lookup
+            # was only ever a default and must not be able to throw.
             parent = get_datablock_from_uuid(
-                parent_id[0], bpy.data.objects[parent_id[1]]
+                parent_id[0], bpy.data.objects.get(parent_id[1])
             )
             # Avoid reloading
             if datablock.parent != parent and parent is not None:
                 datablock.parent = parent
+            elif parent is None:
+                logging.warning(
+                    f"Could not resolve parent '{parent_id[1]}' "
+                    f"(uuid {parent_id[0]}) for '{datablock.name}'; "
+                    f"leaving its current parent alone")
         elif datablock.parent:
             datablock.parent = None
 
