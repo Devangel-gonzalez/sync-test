@@ -1410,6 +1410,73 @@ def test_action_delta_roundtrip_move_and_delete(bpy, multi_user):
     roundtrip("delete a keyframe")
 
 
+def test_action_reload_reuses_slots_and_prunes(bpy, multi_user):
+    """Reloading an Action must reuse its slots and prune curves the dump lacks.
+
+    Removing every slot and rebuilding left the armature with no evaluable
+    animation in between, and because ApplyTimer ran several times a second the
+    bone visibly froze. Reuse fixes that, but it also means a curve the pose
+    overlay invented - one the Host's Action never had - would survive the
+    reload, so curves absent from the dump are pruned. Both halves pull in
+    opposite directions, so both are pinned here.
+    """
+    section("Action reload reuses slots and prunes")
+
+    from multi_user.bl_types import bl_action
+
+    armature = build_scene(bpy, with_action=True)
+    action = armature.animation_data.action
+
+    dumped = bl_action.BlAction.dump(action)
+    identifier_before = action.slots[0].identifier
+    keys_before = bl_action.count_action_keyframes(action)
+
+    # Stand-in for the curves the pose overlay invents: present locally, absent
+    # from the dump, so a reload must remove them.
+    action_fcurves(bpy, action, armature).new(
+        'pose.bones["Bone"].scale', index=0)
+
+    bl_action.BlAction.load(dumped, action)
+
+    # Re-resolve rather than trusting a collection handle held across a
+    # mutation, even one that is supposed to reuse.
+    fcurves = action_fcurves(bpy, action, armature)
+
+    check(len(action.slots) == 1, "the reload keeps exactly one slot")
+    check(
+        action.slots[0].identifier == identifier_before,
+        "the slot was reused rather than recreated (identifier survives)",
+    )
+    # Pruning covers the Blender 5 branch only. The 4.x path deliberately keeps
+    # its pre-existing behaviour, since 5.2.2 is the target version and 4.x
+    # support must not complicate it (README2.MD 4.3 and 7.5).
+    if bpy.app.version >= (5, 0, 0):
+        check(
+            fcurves.find('pose.bones["Bone"].scale', index=0) is None,
+            "a curve the dump does not carry is pruned",
+        )
+    check(
+        bl_action.count_action_keyframes(action) == keys_before,
+        "the reload preserved the dumped keyframes exactly",
+    )
+
+    # The FCurveGroup has to survive too, or the curve lands directly under the
+    # Action instead of nested under its bone in the Dope Sheet.
+    kept = fcurves.find('pose.bones["Bone"].location', index=0)
+    check(kept is not None, "a dumped curve is still present after reload")
+    if kept is not None:
+        dumped_group = None
+        for slot in dumped['slots'].values():
+            for curve in slot.get('fcurves') or []:
+                if (curve['data_path'] == 'pose.bones["Bone"].location'
+                        and curve['dumped_array_index'] == 0):
+                    dumped_group = curve.get('group')
+        check(
+            getattr(kept.group, 'name', None) == dumped_group,
+            "the curve keeps the FCurveGroup the dump recorded",
+        )
+
+
 def ensure_addon_entry(bpy, module_name):
     """Make the package look like an enabled addon to preferences.
 
@@ -1466,6 +1533,7 @@ def main():
         test_action_delta_chain_roundtrip(bpy, multi_user)
         test_action_delta_roundtrip_move_and_delete(bpy, multi_user)
         test_can_publish_common_nodes(multi_user)
+        test_action_reload_reuses_slots_and_prunes(bpy, multi_user)
         test_multi_turn_rotation_is_preserved(bpy, live_sync)
         test_invalidate_overlays_does_not_restore(bpy, live_sync)
     except Exception:
