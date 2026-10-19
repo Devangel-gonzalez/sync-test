@@ -552,6 +552,7 @@ def resolve_modifier_object_refs(modifier: bpy.types.Modifier, dumped: dict):
     """
     for identifier in object_pointer_props(modifier):
         target = None
+        by_name = False
         uuid = dumped.get(f"{identifier}_uuid")
         if uuid:
             target = get_datablock_from_uuid(uuid, None)
@@ -559,7 +560,15 @@ def resolve_modifier_object_refs(modifier: bpy.types.Modifier, dumped: dict):
             name = dumped.get(identifier)
             if isinstance(name, str):
                 target = bpy.data.objects.get(name)
+                by_name = target is not None
         if target is not None:
+            if by_name:
+                # A rename by the apply invalidates every name-based reference,
+                # so this fallback can silently bind to the wrong object.
+                logging.warning(
+                    f"Modifier '{modifier.name}': resolved '{identifier}' by "
+                    f"NAME fallback to '{target.name}'; uuid {uuid!r} matched "
+                    f"no local object")
             setattr(modifier, identifier, target)
         elif getattr(modifier, identifier, None) is None:
             logging.warning(
@@ -670,7 +679,16 @@ class BlObject(ReplicatedDatablock):
         loader.exclude_filter = ["modifiers", "constraints"]
 
         # Load transformation data
+        name_before = datablock.name
         loader.load(datablock, data)
+        if datablock.name != name_before:
+            # A rename by the snapshot apply is what invalidates every
+            # name-based reference on this peer, so record it at the moment it
+            # happens instead of inferring it later from a wrong parent.
+            logging.info(
+                f"Live Sync: apply renamed '{name_before}' to "
+                f"'{datablock.name}' (dump name {data.get('name')!r}, "
+                f"uuid {getattr(datablock, 'uuid', None)!r})")
 
         #  Object display fields
         if "display" in data:
@@ -679,24 +697,32 @@ class BlObject(ReplicatedDatablock):
         #  Parenting
         parent_id = data.get("parent_uid")
         if parent_id:
-            # .get(), not a subscript. This is the *fallback* argument, but
-            # Python evaluates it before get_datablock_from_uuid runs, so
-            # subscripting by name raised KeyError whenever the parent had a
-            # different name locally - which is the normal case, since applying
-            # the snapshot can rename a datablock to avoid a collision. The
-            # uuid in parent_id[0] resolves fine on its own; the name lookup
-            # was only ever a default and must not be able to throw.
-            parent = get_datablock_from_uuid(
-                parent_id[0], bpy.data.objects.get(parent_id[1])
-            )
-            # Avoid reloading
-            if datablock.parent != parent and parent is not None:
-                datablock.parent = parent
-            elif parent is None:
+            # Resolve by uuid first and only then by name, so the log can say
+            # which one answered. A name is not stable across peers: applying
+            # the snapshot renames datablocks, so the name fallback can pick a
+            # different object than the one the Host meant. Subscripting
+            # bpy.data.objects here also used to raise KeyError, aborting the
+            # rest of the load - modifiers, constraints and pose included.
+            parent = get_datablock_from_uuid(parent_id[0], None)
+            by_name = False
+            if parent is None:
+                parent = bpy.data.objects.get(parent_id[1])
+                by_name = parent is not None
+
+            if parent is None:
                 logging.warning(
                     f"Could not resolve parent '{parent_id[1]}' "
                     f"(uuid {parent_id[0]}) for '{datablock.name}'; "
                     f"leaving its current parent alone")
+            else:
+                if by_name:
+                    logging.warning(
+                        f"Parent of '{datablock.name}' resolved by NAME "
+                        f"fallback to '{parent.name}'; uuid {parent_id[0]} "
+                        f"matched no local object")
+                # Avoid reloading
+                if datablock.parent != parent:
+                    datablock.parent = parent
         elif datablock.parent:
             datablock.parent = None
 
