@@ -452,6 +452,10 @@ def dump_modifiers(modifiers: bpy.types.bpy_prop_collection) -> dict:
                 p.object.name for p in modifier.projectors if p and p.object
             ]
 
+        # Every modifier type can hold an object reference, so this runs
+        # unconditionally rather than in the per-type branches below.
+        dump_modifier_object_refs(modifier, dumped_modifier)
+
         dumped_modifiers.append(dumped_modifier)
     return dumped_modifiers
 
@@ -490,6 +494,43 @@ def load_constraints(
         loader.load(new_constraint, dumped_constraint)
 
 
+def object_pointer_props(modifier: bpy.types.Modifier):
+    """Yield the identifiers of a modifier's pointer-to-Object properties.
+
+    Shared by the dump and the load so the two cannot drift apart on which
+    properties count as object references.
+    """
+    for prop in modifier.bl_rna.properties:
+        if prop.type != 'POINTER':
+            continue
+        fixed = getattr(prop, 'fixed_type', None)
+        # fixed_type is not a class on every pointer property, and issubclass
+        # raises TypeError instead of returning False for those.
+        if not isinstance(fixed, type):
+            continue
+        try:
+            if not issubclass(fixed, bpy.types.Object):
+                continue
+        except TypeError:
+            continue
+        yield prop.identifier
+
+
+def dump_modifier_object_refs(modifier: bpy.types.Modifier, dumped: dict):
+    """Record a modifier's object targets by uuid, not only by name.
+
+    Names are not stable across peers: applying the snapshot can rename a
+    datablock to avoid a collision, so a viewer ended up with Esqueleto.002
+    while the dumped modifier still said Esqueleto.001 and resolved to the
+    wrong armature. uuid is the identity this addon replicates by, which is why
+    PARTICLE_SYSTEM already resolves its settings that way.
+    """
+    for identifier in object_pointer_props(modifier):
+        target = getattr(modifier, identifier, None)
+        if target is not None:
+            dumped[f"{identifier}_uuid"] = getattr(target, "uuid", None)
+
+
 def resolve_modifier_object_refs(modifier: bpy.types.Modifier, dumped: dict):
     """Point a loaded modifier's object references at the real datablocks.
 
@@ -504,36 +545,27 @@ def resolve_modifier_object_refs(modifier: bpy.types.Modifier, dumped: dict):
     Shrinkwrap.target, MeshDeform.object, Lattice.object, ...) instead of only
     the one that happened to be reported.
 
-    Leaving an Armature modifier without its target is what makes a parented,
-    automatically weighted mesh keep its vertex groups yet stop following the
-    bone.
+    Resolution prefers uuid and falls back to name, so a datablock renamed by
+    the apply still resolves to the right object. Leaving an Armature modifier
+    without its target is what makes a parented, automatically weighted mesh
+    keep its vertex groups yet stop following the bone.
     """
-    for prop in modifier.bl_rna.properties:
-        if prop.type != 'POINTER':
-            continue
-        fixed = getattr(prop, 'fixed_type', None)
-        # fixed_type is not a class on every pointer property, and issubclass
-        # raises TypeError instead of returning False for those. Letting that
-        # escape would abort load_modifiers, then BlObject.load, and every
-        # Object apply would be caught by ApplyTimer as "Fail to apply".
-        if not isinstance(fixed, type):
-            continue
-        try:
-            targets_object = issubclass(fixed, bpy.types.Object)
-        except TypeError:
-            continue
-        if not targets_object:
-            continue
-        name = dumped.get(prop.identifier)
-        if not isinstance(name, str):
-            continue
-        target = bpy.data.objects.get(name)
+    for identifier in object_pointer_props(modifier):
+        target = None
+        uuid = dumped.get(f"{identifier}_uuid")
+        if uuid:
+            target = get_datablock_from_uuid(uuid, None)
+        if target is None:
+            name = dumped.get(identifier)
+            if isinstance(name, str):
+                target = bpy.data.objects.get(name)
         if target is not None:
-            setattr(modifier, prop.identifier, target)
-        elif getattr(modifier, prop.identifier, None) is None:
+            setattr(modifier, identifier, target)
+        elif getattr(modifier, identifier, None) is None:
             logging.warning(
-                f"Modifier '{modifier.name}': could not resolve target object "
-                f"'{name}' for '{prop.identifier}'; it will have no effect")
+                f"Modifier '{modifier.name}': could not resolve the target "
+                f"object for '{identifier}' (uuid={uuid!r}, "
+                f"name={dumped.get(identifier)!r}); it will have no effect")
 
 
 def load_modifiers(dumped_modifiers: list, modifiers: bpy.types.bpy_prop_collection):
