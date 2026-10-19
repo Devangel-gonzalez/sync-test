@@ -1477,6 +1477,65 @@ def test_action_reload_reuses_slots_and_prunes(bpy, multi_user):
         )
 
 
+def test_modifier_object_refs_survive_reload(bpy, multi_user):
+    """An Armature modifier must keep its target through a dump/load cycle.
+
+    dump_modifiers serialises an ID property as its name, and the generic Loader
+    cannot assign a string back to a pointer property, so load_modifiers rebuilt
+    the modifier with object = None - silently, with no exception and no
+    "Fail to apply" in the log. A parented, automatically weighted mesh then
+    kept its vertex groups but stopped following the bone. It fired the moment a
+    viewer connected, because the snapshot apply runs BlObject.load over an
+    object whose local setup was already correct.
+    """
+    section("Modifier object refs survive a reload")
+
+    from multi_user.bl_types import bl_object
+
+    bpy.ops.mesh.primitive_cube_add()
+    cube = bpy.context.active_object
+    cube.name = "ReloadCube"
+
+    bpy.ops.object.armature_add()
+    armature = bpy.context.active_object
+    armature.name = "ReloadArm"
+
+    bpy.context.view_layer.objects.active = cube
+    cube.modifiers.new("Armature", 'ARMATURE').object = armature
+
+    dumped = bl_object.dump_modifiers(cube.modifiers)
+    check(len(dumped) == 1, "the Armature modifier was dumped")
+
+    # Exactly what BlObject.load does on every apply: clear and rebuild.
+    bl_object.load_modifiers(dumped, cube.modifiers)
+
+    reloaded = cube.modifiers.get("Armature")
+    check(reloaded is not None, "the modifier exists after the reload")
+    if reloaded is not None:
+        check(
+            reloaded.object == armature,
+            "the Armature modifier kept its target object",
+        )
+
+    # A second pointer-to-Object property, so the bl_rna-driven resolution is
+    # shown to be generic rather than a special case for ARMATURE.
+    bpy.ops.mesh.primitive_cube_add()
+    other = bpy.context.active_object
+    other.name = "ReloadOther"
+
+    bpy.context.view_layer.objects.active = cube
+    cube.modifiers.new("Bool", 'BOOLEAN').object = other
+
+    dumped = bl_object.dump_modifiers(cube.modifiers)
+    bl_object.load_modifiers(dumped, cube.modifiers)
+
+    reloaded_bool = cube.modifiers.get("Bool")
+    check(
+        reloaded_bool is not None and reloaded_bool.object == other,
+        "a non-Armature object reference is resolved too",
+    )
+
+
 def ensure_addon_entry(bpy, module_name):
     """Make the package look like an enabled addon to preferences.
 
@@ -1534,6 +1593,7 @@ def main():
         test_action_delta_roundtrip_move_and_delete(bpy, multi_user)
         test_can_publish_common_nodes(multi_user)
         test_action_reload_reuses_slots_and_prunes(bpy, multi_user)
+        test_modifier_object_refs_survive_reload(bpy, multi_user)
         test_multi_turn_rotation_is_preserved(bpy, live_sync)
         test_invalidate_overlays_does_not_restore(bpy, live_sync)
     except Exception:

@@ -490,6 +490,52 @@ def load_constraints(
         loader.load(new_constraint, dumped_constraint)
 
 
+def resolve_modifier_object_refs(modifier: bpy.types.Modifier, dumped: dict):
+    """Point a loaded modifier's object references at the real datablocks.
+
+    The generic Loader cannot restore them: the Dumper serialises an ID
+    property as its name, so assigning that string back to a pointer property
+    is silently skipped and the modifier comes back with the target unset.
+    Probed on 5.2.2 - a dumped Armature modifier carries ``object: 'ProbeArm'``
+    as a plain string.
+
+    Driven off bl_rna rather than an enumerated list of modifier types, so it
+    covers every pointer-to-Object property (Armature.object, Boolean.object,
+    Shrinkwrap.target, MeshDeform.object, Lattice.object, ...) instead of only
+    the one that happened to be reported.
+
+    Leaving an Armature modifier without its target is what makes a parented,
+    automatically weighted mesh keep its vertex groups yet stop following the
+    bone.
+    """
+    for prop in modifier.bl_rna.properties:
+        if prop.type != 'POINTER':
+            continue
+        fixed = getattr(prop, 'fixed_type', None)
+        # fixed_type is not a class on every pointer property, and issubclass
+        # raises TypeError instead of returning False for those. Letting that
+        # escape would abort load_modifiers, then BlObject.load, and every
+        # Object apply would be caught by ApplyTimer as "Fail to apply".
+        if not isinstance(fixed, type):
+            continue
+        try:
+            targets_object = issubclass(fixed, bpy.types.Object)
+        except TypeError:
+            continue
+        if not targets_object:
+            continue
+        name = dumped.get(prop.identifier)
+        if not isinstance(name, str):
+            continue
+        target = bpy.data.objects.get(name)
+        if target is not None:
+            setattr(modifier, prop.identifier, target)
+        elif getattr(modifier, prop.identifier, None) is None:
+            logging.warning(
+                f"Modifier '{modifier.name}': could not resolve target object "
+                f"'{name}' for '{prop.identifier}'; it will have no effect")
+
+
 def load_modifiers(dumped_modifiers: list, modifiers: bpy.types.bpy_prop_collection):
     """Dump all modifiers of a modifier collection into a dict
 
@@ -505,6 +551,7 @@ def load_modifiers(dumped_modifiers: list, modifiers: bpy.types.bpy_prop_collect
         mtype = dumped_modifier.get("type")
         loaded_modifier = modifiers.new(name, mtype)
         loader.load(loaded_modifier, dumped_modifier)
+        resolve_modifier_object_refs(loaded_modifier, dumped_modifier)
 
         if loaded_modifier.type == "NODES":
             load_modifier_geometry_node_props(dumped_modifier, loaded_modifier)

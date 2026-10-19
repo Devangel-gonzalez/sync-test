@@ -686,6 +686,52 @@ reponer esa limpieza explícitamente.
 
 ---
 
+### 6.18 El cubo se desconecta del hueso al conectarse el viewer
+
+**Síntoma:** el Host tiene un cubo emparentado a un hueso con pesos automáticos. Al
+conectarse el cliente, el cubo deja de seguir al hueso — pero **conserva su grupo de
+vértices**. Re-emparentar a mano lo arreglaba hasta la siguiente conexión.
+
+**Causa:** `dump_modifiers` usa el `Dumper` genérico, que serializa una propiedad de
+tipo ID **como su nombre**. Sondeado en 5.2.2: el dump trae `object: 'ProbeArm'`, un
+string. `load_modifiers` hace `modifiers.clear()` → `modifiers.new()` →
+`loader.load()`, y el `Loader` genérico no puede asignar un string a una propiedad
+puntero: lo salta **en silencio**, sin excepción y sin `Fail to apply`. El modificador
+Armature vuelve con `object = None`.
+
+Los vertex groups se vuelcan y cargan por separado (línea ~576), por eso sobreviven.
+Y ocurre justo al conectar porque el apply del snapshot corre `BlObject.load` sobre un
+objeto cuya configuración local **ya era correcta**: la reconstrucción con pérdidas
+reemplaza datos buenos por otros peores. El addon no puede evitar correr ese apply —
+no tiene forma de asumir que los peers arrancan de copias idénticas — así que la
+solución es hacer la reconstrucción fiel, no saltearla.
+
+El precedente ya estaba en el código: `PARTICLE_SYSTEM` resuelve `settings` a mano con
+`get_datablock_from_uuid`, y `UV_PROJECT` resuelve `projectors[i].object` con
+`bpy.data.objects.get(name)`. Ambos demuestran que el loader no resuelve IDs;
+`ARMATURE` simplemente nunca tuvo su caso.
+
+**Arreglo:** `resolve_modifier_object_refs(modifier, dumped)` en `bl_object.py`,
+llamado tras `loader.load()`. Dirigido por `bl_rna` — recorre las propiedades POINTER
+cuyo `fixed_type` sea subclase de `bpy.types.Object` y resuelve el nombre con
+`bpy.data.objects.get()` — de modo que cubre `Armature.object`, `Boolean.object`,
+`Shrinkwrap.target`, `MeshDeform.object`, `Lattice.object` y cualquier otro, en vez
+de enumerar tipos y dejar el resto roto en silencio igual que `ARMATURE`.
+
+**Segundo bug, atrapado por el test antes de llegar a una sesión real:**
+`prop.fixed_type` no es una clase en todas las propiedades POINTER, e `issubclass`
+lanza `TypeError` en vez de devolver `False`. Sin el guard, la excepción subía por
+`load_modifiers` → `BlObject.load` → `porcelain.apply` y **cada apply de un Object
+habría fallado**: el "arreglo" habría roto la carga de objetos por completo. La suite
+anterior pasaba en verde porque ningún test ejercitaba `load_modifiers`.
+
+**Lo fija:** `test_modifier_object_refs_survive_reload`, con un modificador Armature y
+uno Boolean para probar que la resolución es genérica y no un caso especial.
+
+**Nota de método:** la forma del dato volcado se obtuvo por sondeo, no por lectura.
+Asumir que el `Dumper` guardaba un uuid o una referencia habría producido un arreglo
+que no resolvía nada.
+
 ## 7. Cabos sueltos conocidos
 
 1. **Qué re-marca un nodo como FETCHED** sin que el Host commitee. Un log real
@@ -707,3 +753,13 @@ reponer esa limpieza explícitamente.
    de 4.x, y nunca a costa de complicar la rama de Blender 5.
 6. **Rotación con `rotation_mode` distinto entre peers** pierde el conteo de vueltas
    (la conversión pasa por quaternion). Sin impacto mientras ambos usen el mismo modo.
+7. **Reconstrucción inicial cuando los datos ya coinciden — PRIORIDAD MÍNIMA.** Al
+   conectar, el snapshot marca todos los nodos como FETCHED (`repository.loads()`) y
+   `ApplyTimer` los aplica sin comprobar si los datos locales ya coinciden. Con un
+   .blend copiado eso reconstruye el archivo entero sin necesidad y expone cada camino
+   con pérdidas de todos los loaders en el momento menos útil. La guarda de identidad
+   de `ApplyTimer` cubre las aplicaciones **repetidas** del mismo objeto de datos, no
+   la inicial, donde el objeto es nuevo por definición. Evitarlo cambiaría la
+   semántica de convergencia para peers que sí divergieron y exigiría una comparación
+   fiable de datos que contienen numpy. Decisión del usuario, 2026-10-19: dejarlo como
+   la prioridad más baja posible.
