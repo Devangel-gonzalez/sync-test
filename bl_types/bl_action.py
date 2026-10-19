@@ -118,6 +118,14 @@ def dump_fcurve(fcurve: bpy.types.FCurve, use_numpy: bool = True) -> dict:
         "use_numpy": use_numpy
     }
 
+    # The FCurveGroup is what nests a curve under its bone in the Dope Sheet.
+    # Dropping it made every replicated curve land directly under the Action,
+    # so the viewer's bone channel looked empty while its curves sat one level
+    # up - and the pose overlay, which does pass a group, filed its own curves
+    # under the bone, splitting one bone's channels across two levels.
+    if fcurve.group is not None:
+        fcurve_data["group"] = fcurve.group.name
+
     if use_numpy:
         points = fcurve.keyframe_points
         fcurve_data['keyframes_count'] = len(fcurve.keyframe_points)
@@ -296,6 +304,42 @@ def resolve_animation_dependencies(datablock):
         return []
 
 
+# ActionFCurves.new(action_group=...) became
+# ActionChannelbagFCurves.new(group_name=...) in Blender 5.
+_FCURVE_GROUP_KWARG = "action_group" if bpy.app.version < (5, 0, 0) else "group_name"
+
+
+def fcurve_group_kwargs(dumped_fcurve: dict) -> dict:
+    """Keyword filing a new curve under the group the dump recorded.
+
+    Naming a group that does not exist yet is safe: Blender creates it (probed
+    on 5.2.2, where a missing group_name is accepted and materialises the
+    ActionGroup). An empty dict when the dump carries no group, so a genuinely
+    ungrouped curve stays ungrouped instead of being filed under None.
+    """
+    group = dumped_fcurve.get("group")
+    if not group:
+        return {}
+    return {_FCURVE_GROUP_KWARG: group}
+
+
+def apply_fcurve_group(fcurve, groups, group_name):
+    """Move an existing curve into the group the dump says it belongs to.
+
+    Needed for curves created by an earlier build, before the group was dumped:
+    fcurves.find() returns them as-is, sitting directly under the Action, so
+    recreating is not an option and the group has to be assigned afterwards.
+    """
+    if not group_name:
+        return
+    if getattr(fcurve.group, "name", None) == group_name:
+        return
+    group = groups.get(group_name)
+    if group is None:
+        group = groups.new(group_name)
+    fcurve.group = group
+
+
 def count_action_curves(action):
     """Total number of F-Curves an action currently holds.
 
@@ -412,7 +456,12 @@ class BlAction(ReplicatedDatablock):
                         fcurve = channelbag.fcurves.new(
                             dumped_data_path,
                             index=dumped_array_index,
+                            **fcurve_group_kwargs(dumped_fcurve),
                         )
+                    else:
+                        apply_fcurve_group(
+                            fcurve, channelbag.groups,
+                            dumped_fcurve.get("group"))
                     load_fcurve(dumped_fcurve, fcurve)
 
                 # The dump is the whole truth for this slot, so drop curves it
@@ -442,7 +491,12 @@ class BlAction(ReplicatedDatablock):
                         dumped_data_path, index=dumped_array_index)
                     if fcurve is None:
                         fcurve = datablock.fcurves.new(
-                            dumped_data_path, index=dumped_array_index)
+                            dumped_data_path, index=dumped_array_index,
+                            **fcurve_group_kwargs(dumped_fcurve))
+                    else:
+                        apply_fcurve_group(
+                            fcurve, datablock.groups,
+                            dumped_fcurve.get("group"))
 
                     load_fcurve(dumped_fcurve, fcurve)
 
