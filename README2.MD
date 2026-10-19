@@ -259,16 +259,44 @@ es la verdad completa de su slot.
 **El podado cubre solo la rama de Blender 5.** La rama 4.x sigue sin podar y
 arrastra un quirk preexistente: itera `data["fcurves"]` una vez por slot.
 
-### 4.4 El overlay SÍ debe crear curvas faltantes
+### 4.4 El overlay SÍ debe crear curvas faltantes — es una feature, no un bug
 
-`test_pose_overlay` fija `missing rotation/scale curves created`. Si el Action del
-viewer no tiene la curva que el Host está editando, sin creación no se vería nada.
+`_write_pose` escribe **siempre** location + rotation + scale (9 canales) y crea la
+curva si no existe. Es intencional y **no debe "optimizarse"**.
 
-> **Error cometido:** hice que `_write_pose` salteara canales sin curva existente, y
-> después que salteara canales "sin cambio" comparando contra `bone.location` /
-> `rotation_euler` / `scale`. Esa base es el valor en el frame del **viewer**, y el
-> overlay escribe en el frame del **Host**: con timelines independientes son frames
-> distintos por diseño. Fallaron 2 tests. Revertido.
+El overlay no refleja el Action del Host: muestra **la pose actual del Host**, esté
+animada o no. Caso de uso real, dado por el usuario el 2026-10-19:
+
+> Tienes una animación que rota en X de 0 grados en el frame 0 a 360 grados en el
+> frame 90, en la posición XYZ 0,0,0 (sin keyframe en la posición). Si quisieras ver
+> cómo se vería esa animación pero con la posición XYZ 10,40,20, la build actual sí
+> permite eso.
+
+Eso solo funciona porque el overlay crea las curvas de posición que el Action no
+tiene. Restringirlo a "los canales que el Action ya tiene" destruiría la
+previsualización de una pose no animada sobre una animación existente, que es justo
+lo que un revisor quiere hacer. `test_pose_overlay` lo fija con
+`missing rotation/scale curves created`.
+
+**Descartado explícitamente (2026-10-19):** que el Host declare qué canales tiene, o
+cuáles está editando vía `constraint_axis` del operador de transform, para que el
+viewer keyee solo esos. Parece la optimización obvia y **rompe el caso de uso de
+arriba**. No reimplementarla.
+
+Las curvas inventadas no se filtran al archivo: `_restore` quita las de
+`edit.created_curves`, y un apply de porcelain poda las que el dump no trae (4.3).
+
+> **Tres errores cometidos al intentar restringirlo:**
+> 1. Saltear canales sin curva existente. Rompió el caso legítimo de arriba; lo cazó
+>    el test.
+> 2. Saltear canales "sin cambio" comparando contra `bone.location` /
+>    `rotation_euler` / `scale`. Base equivocada: esos son los valores en el frame
+>    del **viewer**, y el overlay escribe en el frame del **Host**. Con timelines
+>    independientes son frames distintos por diseño. Fallaron 2 tests. Revertido.
+> 3. Enviar un mapa `edited` comparando pose evaluada contra `bpy.data`. Durante un
+>    transform modal Blender escribe **directo en `bpy.data`**, así que la
+>    comparación daba siempre vacío y el overlay dejó de keyear por completo.
+>    Revertido.
 
 ### 4.5 `start` se emite una vez por selección
 
