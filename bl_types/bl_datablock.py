@@ -32,8 +32,17 @@ def get_datablock_from_uuid(uuid, default, ignore=[]):
     return default
 
 
-def resolve_datablock_from_uuid(uuid, bpy_collection):
+def resolve_datablock_from_uuid(uuid, bpy_collection, name=None):
     for item in bpy_collection:
         if getattr(item, 'uuid', None) == uuid:
             return item
+    # A .blend copied before the session was hosted carries no uuids, so nothing
+    # matches and every datablock would be recreated under a bumped name,
+    # dropping the originals and leaving every pointer to them dangling. Names
+    # are unique within a bpy.data collection by construction, so a name match
+    # is unambiguous - and BlObject.load already falls back this way for an
+    # object's own data via find_data_from_name, which is why a viewer kept its
+    # mesh name while its object got duplicated.
+    if name:
+        return bpy_collection.get(name)
     return None

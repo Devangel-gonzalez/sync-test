@@ -1011,7 +1011,14 @@ class BlObject(ReplicatedDatablock):
     @staticmethod
     def resolve(data: dict) -> object:
         uuid = data.get("uuid")
-        return resolve_datablock_from_uuid(uuid, bpy.data.objects)
+        # Name fallback, so a viewer whose .blend was copied before the session
+        # was hosted - and therefore carries no uuids - pairs with the objects
+        # it already has instead of getting duplicates under bumped names.
+        # Without it every object was recreated, the originals dropped, and
+        # pointers such as an Armature modifier's target left dangling.
+        return resolve_datablock_from_uuid(
+            uuid, bpy.data.objects, data.get("name")
+        )
 
 
 _type = bpy.types.Object
